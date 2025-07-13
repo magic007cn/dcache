@@ -15,6 +15,7 @@ import (
 var (
 	cfgFile string
 	logLevel string
+	raftLogLevel string
 )
 
 func main() {
@@ -28,6 +29,7 @@ for data consistency across multiple nodes.`,
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./config.yaml)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&raftLogLevel, "raft-log-level", "warn", "raft log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().String("cluster-id", "", "cluster id")
 	rootCmd.PersistentFlags().String("data-dir", "", "data directory")
 	rootCmd.PersistentFlags().String("listen-client-urls", "", "listen client urls")
@@ -39,6 +41,7 @@ for data consistency across multiple nodes.`,
 
 	// 绑定flag到viper
 	_ = viper.BindPFlag("log-level", rootCmd.PersistentFlags().Lookup("log-level"))
+	_ = viper.BindPFlag("raft-log-level", rootCmd.PersistentFlags().Lookup("raft-log-level"))
 	_ = viper.BindPFlag("cluster-id", rootCmd.PersistentFlags().Lookup("cluster-id"))
 	_ = viper.BindPFlag("data-dir", rootCmd.PersistentFlags().Lookup("data-dir"))
 	_ = viper.BindPFlag("listen-client-urls", rootCmd.PersistentFlags().Lookup("listen-client-urls"))

@@ -55,7 +55,15 @@ func NewManager(cfg *config.Config, log *logrus.Logger) (*Manager, error) {
 	raftConfig.CommitTimeout = 5000 * time.Millisecond
 	raftConfig.MaxAppendEntries = 64
 	raftConfig.ShutdownOnRemove = false
-	raftConfig.LogLevel = "DEBUG"
+	
+	// Set Raft log level from config
+	raftLogLevel := strings.ToUpper(cfg.RaftLogLevel)
+	switch raftLogLevel {
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		raftConfig.LogLevel = raftLogLevel
+	default:
+		raftConfig.LogLevel = "WARN"
+	}
 
 	// Create log store 和 stable store 都用 BadgerStore
 	logStore := store

@@ -19,6 +19,7 @@ type Config struct {
 	InitialAdvertisePeerURLs string `mapstructure:"initial-advertise-peer-urls"`
 	InitialCluster      string   `mapstructure:"initial-cluster"`
 	LogLevel            string   `mapstructure:"log-level"`
+	RaftLogLevel        string   `mapstructure:"raft-log-level"`
 	GrpcPort            int      `mapstructure:"grpc-port"`
 }
 
@@ -35,6 +36,7 @@ func Load(configFile string) (*Config, error) {
 	v.SetDefault("listen-peer-urls", "http://127.0.0.1:8081")
 	v.SetDefault("initial-advertise-peer-urls", "http://127.0.0.1:8081")
 	v.SetDefault("log-level", "info")
+	v.SetDefault("raft-log-level", "warn")
 	v.SetDefault("grpc-port", 50051)
 
 	// Read from command line flags
@@ -47,6 +49,7 @@ func Load(configFile string) (*Config, error) {
 	v.BindEnv("initial-advertise-peer-urls", "INITIAL_ADVERTISE_PEER_URLS")
 	v.BindEnv("initial-cluster", "INITIAL_CLUSTER")
 	v.BindEnv("log-level", "LOG_LEVEL")
+	v.BindEnv("raft-log-level", "RAFT_LOG_LEVEL")
 	v.BindEnv("grpc-port", "GRPC_PORT")
 
 	// Read from config file if specified

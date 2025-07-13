@@ -22,4 +22,5 @@ initial-advertise-peer-urls: "http://127.0.0.1:8081"
 initial-cluster: ""
 
 # Log level
-log-level: "debug" 
+log-level: "debug"
+raft-log-level: "warn" 
