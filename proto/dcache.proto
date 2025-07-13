@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package dcache;
+
+option go_package = "github.com/dcache/proto";
+
+// DCache service definition
+service DCache {
+  // Set a key-value pair
+  rpc Set(SetRequest) returns (SetResponse);
+  
+  // Get a value by key
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // Delete a key
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // Scan keys with prefix
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  
+  // Get cluster status
+  rpc Status(StatusRequest) returns (StatusResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Set operation
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message SetResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Get operation
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool success = 1;
+  string value = 2;
+  string error = 3;
+}
+
+// Delete operation
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Scan operation
+message ScanRequest {
+  string prefix = 1;
+  int32 limit = 2;
+}
+
+message ScanResponse {
+  bool success = 1;
+  repeated KeyValue pairs = 2;
+  string error = 3;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Status operation
+message StatusRequest {}
+
+message StatusResponse {
+  bool success = 1;
+  string leader = 2;
+  repeated string nodes = 3;
+  string error = 4;
+}
+
+// Health operation
+message HealthRequest {}
+
+message HealthResponse {
+  bool success = 1;
+  string status = 2;
+  string error = 3;
+} 

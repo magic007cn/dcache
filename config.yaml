@@ -1,0 +1,25 @@
+# Distributed Cache Configuration
+
+# Cluster configuration
+cluster-id: "dcache-cluster-1"
+
+# Data directory for storage
+data-dir: "./data"
+
+# Client API endpoints
+listen-client-urls: "http://127.0.0.1:8080"
+advertise-client-urls: "http://127.0.0.1:8080"
+
+# gRPC endpoints
+grpc-port: 9090
+
+# Raft peer endpoints
+listen-peer-urls: "http://127.0.0.1:8081"
+initial-advertise-peer-urls: "http://127.0.0.1:8081"
+
+# Initial cluster configuration (for first node)
+# Format: "node1=http://127.0.0.1:8081,node2=http://127.0.0.1:8082,node3=http://127.0.0.1:8083"
+initial-cluster: ""
+
+# Log level
+log-level: "debug" 
