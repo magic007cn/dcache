@@ -21,6 +21,6 @@ initial-advertise-peer-urls: "tcp://127.0.0.1:9094"
 initial-cluster: ""
 
 # Log level
-log-level: "debug"
+log-level: "warn"
 raft-log-level: "warn" 
 node-id: "node4" 

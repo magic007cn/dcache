@@ -28,7 +28,7 @@ for data consistency across multiple nodes.`,
 	}
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./config.yaml)")
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "warn", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&raftLogLevel, "raft-log-level", "warn", "raft log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().String("cluster-id", "", "cluster id")
 	rootCmd.PersistentFlags().String("data-dir", "", "data directory")

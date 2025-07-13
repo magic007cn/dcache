@@ -35,7 +35,7 @@ func Load(configFile string) (*Config, error) {
 	v.SetDefault("advertise-client-urls", "http://127.0.0.1:8080")
 	v.SetDefault("listen-peer-urls", "http://127.0.0.1:8081")
 	v.SetDefault("initial-advertise-peer-urls", "http://127.0.0.1:8081")
-	v.SetDefault("log-level", "info")
+	v.SetDefault("log-level", "warn")
 	v.SetDefault("raft-log-level", "warn")
 	v.SetDefault("grpc-port", 50051)
 
