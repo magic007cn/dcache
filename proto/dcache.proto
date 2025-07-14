@@ -2,93 +2,180 @@ syntax = "proto3";
 
 package dcache;
 
-option go_package = "github.com/dcache/proto";
+option go_package = "dcache/proto";
 
-// DCache service definition
-service DCache {
-  // Set a key-value pair
-  rpc Set(SetRequest) returns (SetResponse);
-  
-  // Get a value by key
-  rpc Get(GetRequest) returns (GetResponse);
-  
-  // Delete a key
-  rpc Delete(DeleteRequest) returns (DeleteResponse);
-  
-  // Scan keys with prefix
-  rpc Scan(ScanRequest) returns (ScanResponse);
-  
-  // Get cluster status
-  rpc Status(StatusRequest) returns (StatusResponse);
-  
-  // Health check
-  rpc Health(HealthRequest) returns (HealthResponse);
+// 通用响应头
+message Header {
+  string cluster_id = 1;
+  string node_id = 2;
+  uint64 revision = 3;
+  uint64 raft_term = 4;
 }
 
-// Set operation
+// KeyValue结构
+message KeyValue {
+  string key = 1;
+  string value = 2;
+  uint64 create_revision = 3;
+  uint64 mod_revision = 4;
+  uint64 version = 5;
+}
+
+// Set
 message SetRequest {
   string key = 1;
   string value = 2;
 }
-
 message SetResponse {
-  bool success = 1;
-  string error = 2;
+  Header header = 1;
+  int32 success_count = 2;
+  int32 error_count = 3;
+  repeated string errors = 4;
+  int32 code = 5;
+  string error = 6;
 }
 
-// Get operation
+// Get
 message GetRequest {
   string key = 1;
 }
-
 message GetResponse {
-  bool success = 1;
-  string value = 2;
-  string error = 3;
+  Header header = 1;
+  repeated KeyValue kvs = 2;
+  int32 success_count = 3;
+  int32 error_count = 4;
+  repeated string errors = 5;
+  int32 code = 6;
+  string error = 7;
 }
 
-// Delete operation
+// Delete
 message DeleteRequest {
   string key = 1;
+  bool error_on_not_exists = 2; // 新增，默认false
 }
-
 message DeleteResponse {
-  bool success = 1;
-  string error = 2;
+  Header header = 1;
+  int32 success_count = 2;
+  int32 error_count = 3;
+  repeated string errors = 4;
+  int32 code = 5;
+  string error = 6;
 }
 
-// Scan operation
-message ScanRequest {
+// RangeScan
+message RangeScanRequest {
   string prefix = 1;
   int32 limit = 2;
 }
-
-message ScanResponse {
-  bool success = 1;
-  repeated KeyValue pairs = 2;
-  string error = 3;
+message RangeScanResponse {
+  Header header = 1;
+  repeated KeyValue kvs = 2;
+  int32 success_count = 3;
+  int32 error_count = 4;
+  repeated string errors = 5;
+  int32 code = 6;
+  string error = 7;
 }
 
-message KeyValue {
-  string key = 1;
-  string value = 2;
+// BatchSet
+message BatchSetRequest {
+  repeated KeyValue pairs = 1;
+}
+message BatchSetResponse {
+  Header header = 1;
+  int32 success_count = 2;
+  int32 error_count = 3;
+  repeated string errors = 4;
+  int32 code = 5;
+  string error = 6;
 }
 
-// Status operation
+// BatchGet
+message BatchGetRequest {
+  repeated string keys = 1;
+}
+message BatchGetResponse {
+  Header header = 1;
+  repeated KeyValue kvs = 2;
+  int32 success_count = 3;
+  int32 error_count = 4;
+  repeated string errors = 5;
+  int32 code = 6;
+  string error = 7;
+}
+
+// BatchDelete
+message BatchDeleteRequest {
+  repeated string keys = 1;
+  bool error_on_not_exists = 2; // 新增，默认false
+}
+message BatchDeleteResponse {
+  Header header = 1;
+  int32 success_count = 2;
+  int32 error_count = 3;
+  repeated string errors = 4;
+  int32 code = 5;
+  string error = 6;
+}
+
+// StreamSet
+message StreamSetResponse {
+  Header header = 1;
+  int32 success_count = 2;
+  int32 error_count = 3;
+  repeated string errors = 4;
+  int32 code = 5;
+  string error = 6;
+}
+
+// Status
 message StatusRequest {}
-
 message StatusResponse {
-  bool success = 1;
+  Header header = 1;
   string leader = 2;
   repeated string nodes = 3;
+  bool is_leader = 4;
+  int32 code = 5;
+  string error = 6;
+}
+
+// Health
+message HealthRequest {}
+message HealthResponse {
+  Header header = 1;
+  string status = 2;
+  string role = 3;
+  int32 code = 4;
+  string error = 5;
+}
+
+// Members
+message MembersRequest {}
+message ClusterMember {
+  string node_id = 1;
+  string node_name = 2;
+  string role = 3;
+  string address = 4;
+}
+message MembersResponse {
+  Header header = 1;
+  repeated ClusterMember members = 2;
+  int32 code = 3;
   string error = 4;
 }
 
-// Health operation
-message HealthRequest {}
-
-message HealthResponse {
-  bool success = 1;
-  string status = 2;
-  string error = 3;
+// DCache service
+service DCache {
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc RangeScan(RangeScanRequest) returns (RangeScanResponse);
+  rpc BatchSet(BatchSetRequest) returns (BatchSetResponse);
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  rpc BatchDelete(BatchDeleteRequest) returns (BatchDeleteResponse);
+  rpc StreamSet(stream SetRequest) returns (StreamSetResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Members(MembersRequest) returns (MembersResponse);
 } 

@@ -13,6 +13,7 @@ type Config struct {
 	NodeID              string   `mapstructure:"node-id"`
 	ClusterID           string   `mapstructure:"cluster-id"`
 	DataDir             string   `mapstructure:"data-dir"`
+	StorageMode         string   `mapstructure:"storage-mode"`
 	ListenClientURLs    string   `mapstructure:"listen-client-urls"`
 	AdvertiseClientURLs string   `mapstructure:"advertise-client-urls"`
 	ListenPeerURLs      string   `mapstructure:"listen-peer-urls"`
@@ -25,16 +26,17 @@ type Config struct {
 
 // Load loads configuration from file or environment variables
 func Load(configFile string) (*Config, error) {
-	v := viper.New()
+	v := viper.GetViper()
 
 	// Set defaults
 	v.SetDefault("node-id", "node1")
 	v.SetDefault("cluster-id", "dcache-cluster")
 	v.SetDefault("data-dir", "./data")
+	v.SetDefault("storage-mode", "inmemory")
 	v.SetDefault("listen-client-urls", "http://127.0.0.1:8080")
 	v.SetDefault("advertise-client-urls", "http://127.0.0.1:8080")
-	v.SetDefault("listen-peer-urls", "http://127.0.0.1:8081")
-	v.SetDefault("initial-advertise-peer-urls", "http://127.0.0.1:8081")
+	v.SetDefault("listen-peer-urls", "tcp://127.0.0.1:9091")
+	v.SetDefault("initial-advertise-peer-urls", "tcp://127.0.0.1:9091")
 	v.SetDefault("log-level", "warn")
 	v.SetDefault("raft-log-level", "warn")
 	v.SetDefault("grpc-port", 50051)
@@ -43,6 +45,7 @@ func Load(configFile string) (*Config, error) {
 	v.BindEnv("node-id", "NODE_ID")
 	v.BindEnv("cluster-id", "CLUSTER_ID")
 	v.BindEnv("data-dir", "DATA_DIR")
+	v.BindEnv("storage-mode", "STORAGE_MODE")
 	v.BindEnv("listen-client-urls", "LISTEN_CLIENT_URLS")
 	v.BindEnv("advertise-client-urls", "ADVERTISE_CLIENT_URLS")
 	v.BindEnv("listen-peer-urls", "LISTEN_PEER_URLS")
@@ -83,6 +86,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("data-dir is required")
 	}
 
+	// Validate storage mode
+	if c.StorageMode != "inmemory" && c.StorageMode != "persistent" {
+		return fmt.Errorf("storage-mode must be either 'inmemory' or 'persistent', got: %s", c.StorageMode)
+	}
+
 	if c.ListenClientURLs == "" {
 		return fmt.Errorf("listen-client-urls is required")
 	}
@@ -91,9 +99,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen-peer-urls is required")
 	}
 
-	// Create data directory if it doesn't exist
-	if err := os.MkdirAll(c.DataDir, 0755); err != nil {
-		return fmt.Errorf("failed to create data directory: %v", err)
+	// Create data directory if it doesn't exist (only for persistent mode)
+	if c.StorageMode == "persistent" {
+		if err := os.MkdirAll(c.DataDir, 0755); err != nil {
+			return fmt.Errorf("failed to create data directory: %v", err)
+		}
 	}
 
 	return nil
@@ -117,8 +127,9 @@ func (c *Config) GetInitialClusterMap() map[string]string {
 		if len(parts) == 2 {
 			nodeID := strings.TrimSpace(parts[0])
 			peerURL := strings.TrimSpace(parts[1])
-			// Remove both http:// and tcp:// prefix if present
+			// Remove all possible prefixes
 			peerURL = strings.TrimPrefix(peerURL, "http://")
+			peerURL = strings.TrimPrefix(peerURL, "https://")
 			peerURL = strings.TrimPrefix(peerURL, "tcp://")
 			clusterMap[nodeID] = peerURL
 		}

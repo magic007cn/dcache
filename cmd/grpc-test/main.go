@@ -2,175 +2,261 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"time"
 
+	pb "dcache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	pb "dcache/proto"
 )
 
-func main() {
-	// 解析命令行参数
-	var addr string
-	flag.StringVar(&addr, "addr", "127.0.0.1:8081", "gRPC server address")
-	flag.Parse()
+type GrpcClient struct {
+	conn   *grpc.ClientConn
+	client pb.DCacheClient
+}
 
-	// 连接到 gRPC 服务器
+func NewGrpcClient(addr string) (*GrpcClient, error) {
+	// Create a single connection that will be reused
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("Failed to connect to %s: %v", addr, err)
+		return nil, fmt.Errorf("failed to connect: %v", err)
 	}
-	defer conn.Close()
 
-	// 创建 gRPC 客户端
 	client := pb.NewDCacheClient(conn)
+	return &GrpcClient{
+		conn:   conn,
+		client: client,
+	}, nil
+}
 
-	// 设置超时上下文
+func (c *GrpcClient) Close() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+func (c *GrpcClient) Set(key, value string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Set(ctx, &pb.SetRequest{Key: key, Value: value})
+	if err != nil {
+		return fmt.Errorf("set failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("set failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func (c *GrpcClient) Get(key string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Get(ctx, &pb.GetRequest{Key: key})
+	if err != nil {
+		return "", fmt.Errorf("get failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return "", fmt.Errorf("get failed: %s", resp.Error)
+	}
+
+	if len(resp.Kvs) == 0 {
+		return "", fmt.Errorf("key not found")
+	}
+	return resp.Kvs[0].Value, nil
+}
+
+func (c *GrpcClient) Delete(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Delete(ctx, &pb.DeleteRequest{Key: key})
+	if err != nil {
+		return fmt.Errorf("delete failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("delete failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func (c *GrpcClient) BatchSet(pairs []*pb.KeyValue) (*pb.BatchSetResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	fmt.Printf("=== DCache gRPC Test (connecting to %s) ===\n", addr)
+	resp, err := c.client.BatchSet(ctx, &pb.BatchSetRequest{Pairs: pairs})
+	if err != nil {
+		return nil, fmt.Errorf("batch set failed: %v", err)
+	}
 
-	fmt.Println("=== DCache gRPC Test ===")
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("batch set failed: %s", resp.Error)
+	}
 
-	// 测试 Set 操作
-	fmt.Println("\n1. Testing SET operations...")
-	testSet(client, ctx, "test_key1", "value1")
-	testSet(client, ctx, "test_key2", "value2")
-	testSet(client, ctx, "user:1", "john")
-	testSet(client, ctx, "user:2", "jane")
-	testSet(client, ctx, "config:debug", "true")
-
-	// 测试 Get 操作
-	fmt.Println("\n2. Testing GET operations...")
-	testGet(client, ctx, "test_key1")
-	testGet(client, ctx, "test_key2")
-	testGet(client, ctx, "user:1")
-	testGet(client, ctx, "nonexistent_key")
-
-	// 测试 Scan 操作
-	fmt.Println("\n3. Testing SCAN operations...")
-	testScan(client, ctx, "test_", 10)
-	testScan(client, ctx, "user:", 10)
-	testScan(client, ctx, "config:", 10)
-
-	// 测试 Delete 操作
-	fmt.Println("\n4. Testing DELETE operations...")
-	testDelete(client, ctx, "test_key1")
-	testDelete(client, ctx, "user:1")
-
-	// 验证删除后的状态
-	fmt.Println("\n5. Verifying after DELETE...")
-	testGet(client, ctx, "test_key1")
-	testScan(client, ctx, "test_", 10)
-	testScan(client, ctx, "user:", 10)
-
-	// 测试 Status 和 Health
-	fmt.Println("\n6. Testing STATUS and HEALTH...")
-	testStatus(client, ctx)
-	testHealth(client, ctx)
-
-	fmt.Println("\n=== Test completed ===")
+	return resp, nil
 }
 
-func testSet(client pb.DCacheClient, ctx context.Context, key, value string) {
-	resp, err := client.Set(ctx, &pb.SetRequest{
-		Key:   key,
-		Value: value,
-	})
+func (c *GrpcClient) BatchGet(keys []string) (*pb.BatchGetResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.client.BatchGet(ctx, &pb.BatchGetRequest{Keys: keys})
 	if err != nil {
-		fmt.Printf("SET %s failed: %v\n", key, err)
-		return
+		return nil, fmt.Errorf("batch get failed: %v", err)
 	}
-	if resp.Success {
-		fmt.Printf("SET %s = %s ✓\n", key, value)
+
+	// 即使有部分错误也返回结果，让调用者处理
+	return resp, nil
+}
+
+func (c *GrpcClient) BatchDelete(keys []string) (*pb.BatchDeleteResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.client.BatchDelete(ctx, &pb.BatchDeleteRequest{Keys: keys})
+	if err != nil {
+		return nil, fmt.Errorf("batch delete failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("batch delete failed: %s", resp.Error)
+	}
+
+	return resp, nil
+}
+
+func (c *GrpcClient) Status() (*pb.StatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Status(ctx, &pb.StatusRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("status failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("status failed: %s", resp.Error)
+	}
+
+	return resp, nil
+}
+
+func (c *GrpcClient) Health() (*pb.HealthResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Health(ctx, &pb.HealthRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("health check failed: %v", err)
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("health check failed: %s", resp.Error)
+	}
+
+	return resp, nil
+}
+
+func main() {
+	// Create gRPC client with connection reuse
+	client, err := NewGrpcClient("127.0.0.1:8081")
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	// Test health check
+	fmt.Println("=== Health Check ===")
+	health, err := client.Health()
+	if err != nil {
+		log.Printf("Health check failed: %v", err)
 	} else {
-		fmt.Printf("SET %s failed: %s\n", key, resp.Error)
+		fmt.Printf("Health: %s\n", health.Status)
 	}
-}
 
-func testGet(client pb.DCacheClient, ctx context.Context, key string) {
-	resp, err := client.Get(ctx, &pb.GetRequest{
-		Key: key,
-	})
+	// Test status
+	fmt.Println("\n=== Status ===")
+	status, err := client.Status()
 	if err != nil {
-		fmt.Printf("GET %s failed: %v\n", key, err)
-		return
-	}
-	if resp.Success {
-		fmt.Printf("GET %s = %s ✓\n", key, resp.Value)
+		log.Printf("Status failed: %v", err)
 	} else {
-		fmt.Printf("GET %s failed: %s\n", key, resp.Error)
+		fmt.Printf("Leader: %s\n", status.Leader)
+		fmt.Printf("Nodes: %v\n", status.Nodes)
 	}
-}
 
-func testDelete(client pb.DCacheClient, ctx context.Context, key string) {
-	resp, err := client.Delete(ctx, &pb.DeleteRequest{
-		Key: key,
-	})
+	// Test single operations
+	fmt.Println("\n=== Single Operations ===")
+	
+	// Set
+	err = client.Set("test-key", "test-value")
 	if err != nil {
-		fmt.Printf("DELETE %s failed: %v\n", key, err)
-		return
-	}
-	if resp.Success {
-		fmt.Printf("DELETE %s ✓\n", key)
+		log.Printf("Set failed: %v", err)
 	} else {
-		fmt.Printf("DELETE %s failed: %s\n", key, resp.Error)
+		fmt.Println("Set: OK")
 	}
-}
 
-func testScan(client pb.DCacheClient, ctx context.Context, prefix string, limit int32) {
-	resp, err := client.Scan(ctx, &pb.ScanRequest{
-		Prefix: prefix,
-		Limit:  limit,
-	})
+	// Get
+	value, err := client.Get("test-key")
 	if err != nil {
-		fmt.Printf("SCAN %s failed: %v\n", prefix, err)
-		return
+		log.Printf("Get failed: %v", err)
+	} else {
+		fmt.Printf("Get: %s\n", value)
 	}
-	if resp.Success {
-		fmt.Printf("SCAN %s (limit: %d):\n", prefix, limit)
-		if len(resp.Pairs) == 0 {
-			fmt.Printf("  No keys found\n")
-		} else {
-			for _, pair := range resp.Pairs {
-				fmt.Printf("  %s = %s\n", pair.Key, pair.Value)
-			}
+
+	// Test batch operations
+	fmt.Println("\n=== Batch Operations ===")
+	
+	// Batch Set
+	batchPairs := []*pb.KeyValue{
+		{Key: "batch-key1", Value: "batch-value1"},
+		{Key: "batch-key2", Value: "batch-value2"},
+		{Key: "batch-key3", Value: "batch-value3"},
+	}
+	
+	batchSetResp, err := client.BatchSet(batchPairs)
+	if err != nil {
+		log.Printf("Batch set failed: %v", err)
+	} else {
+		fmt.Printf("Batch Set: SuccessCount=%d, ErrorCount=%d\n", 
+			batchSetResp.SuccessCount, batchSetResp.ErrorCount)
+		if len(batchSetResp.Errors) > 0 {
+			fmt.Printf("Errors: %v\n", batchSetResp.Errors)
 		}
-		fmt.Printf("  Total: %d keys ✓\n", len(resp.Pairs))
-	} else {
-		fmt.Printf("SCAN %s failed: %s\n", prefix, resp.Error)
 	}
-}
 
-func testStatus(client pb.DCacheClient, ctx context.Context) {
-	resp, err := client.Status(ctx, &pb.StatusRequest{})
+	// Batch Get
+	batchKeys := []string{"batch-key1", "batch-key2", "batch-key3", "nonexistent-key"}
+	batchGetResp, err := client.BatchGet(batchKeys)
 	if err != nil {
-		fmt.Printf("STATUS failed: %v\n", err)
-		return
-	}
-	if resp.Success {
-		fmt.Printf("STATUS:\n")
-		fmt.Printf("  Leader: %s\n", resp.Leader)
-		fmt.Printf("  Nodes: %v\n", resp.Nodes)
-		fmt.Printf("  ✓\n")
+		log.Printf("Batch get failed: %v", err)
 	} else {
-		fmt.Printf("STATUS failed: %s\n", resp.Error)
+		fmt.Printf("Batch Get: SuccessCount=%d, ErrorCount=%d\n", 
+			batchGetResp.SuccessCount, batchGetResp.ErrorCount)
+		fmt.Printf("Pairs: %v\n", batchGetResp.Kvs)
+		if len(batchGetResp.Errors) > 0 {
+			fmt.Printf("Errors: %v\n", batchGetResp.Errors)
+		}
 	}
-}
 
-func testHealth(client pb.DCacheClient, ctx context.Context) {
-	resp, err := client.Health(ctx, &pb.HealthRequest{})
+	// Batch Delete
+	batchDeleteKeys := []string{"batch-key1", "batch-key2", "nonexistent-key"}
+	batchDeleteResp, err := client.BatchDelete(batchDeleteKeys)
 	if err != nil {
-		fmt.Printf("HEALTH failed: %v\n", err)
-		return
-	}
-	if resp.Success {
-		fmt.Printf("HEALTH: %s ✓\n", resp.Status)
+		log.Printf("Batch delete failed: %v", err)
 	} else {
-		fmt.Printf("HEALTH failed: %s\n", resp.Error)
+		fmt.Printf("Batch Delete: SuccessCount=%d, ErrorCount=%d\n", 
+			batchDeleteResp.SuccessCount, batchDeleteResp.ErrorCount)
+		if len(batchDeleteResp.Errors) > 0 {
+			fmt.Printf("Errors: %v\n", batchDeleteResp.Errors)
+		}
 	}
+
+	fmt.Println("\n=== Test Completed ===")
 } 

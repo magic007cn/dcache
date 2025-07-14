@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
@@ -30,12 +29,11 @@ type KeyValue struct {
 // BadgerStore implements the Raft FSM interface using BadgerDB
 type BadgerStore struct {
 	db   *badger.DB
-	mu   sync.RWMutex
 	log  *logrus.Logger
 }
 
 // NewBadgerStore creates a new BadgerStore instance
-func NewBadgerStore(dataDir string, log *logrus.Logger) (*BadgerStore, error) {
+func NewBadgerStore(dataDir string, storageMode string, log *logrus.Logger) (*BadgerStore, error) {
 	opts := badger.DefaultOptions(dataDir)
 	opts.Logger = nil // Disable badger's internal logging
 	opts.ValueLogFileSize = 1 << 20 // 1MB
@@ -43,10 +41,20 @@ func NewBadgerStore(dataDir string, log *logrus.Logger) (*BadgerStore, error) {
 	opts.MemTableSize = 64 << 20 // 64MB
 	opts.ValueLogMaxEntries = 1000000
 	
-	// 配置为纯内存模式
-	opts.InMemory = true // 启用内存模式
-	opts.Dir = ""        // 空目录表示纯内存
-	opts.ValueDir = ""   // 空值目录表示纯内存
+	// 根据 storage-mode 配置存储模式
+	if storageMode == "inmemory" {
+		// 配置为纯内存模式
+		opts.InMemory = true // 启用内存模式
+		opts.Dir = ""        // 空目录表示纯内存
+		opts.ValueDir = ""   // 空值目录表示纯内存
+		log.Infof("Using in-memory storage mode")
+	} else {
+		// 配置为持久化模式
+		opts.InMemory = false
+		opts.Dir = dataDir
+		opts.ValueDir = dataDir
+		log.Infof("Using persistent storage mode with data directory: %s", dataDir)
+	}
 
 	db, err := badger.Open(opts)
 	if err != nil {
@@ -61,9 +69,6 @@ func NewBadgerStore(dataDir string, log *logrus.Logger) (*BadgerStore, error) {
 
 // Apply applies a log entry to the FSM
 func (s *BadgerStore) Apply(log *raft.Log) interface{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	var result interface{}
 	err := s.db.Update(func(txn *badger.Txn) error {
 		switch log.Type {
@@ -78,8 +83,26 @@ func (s *BadgerStore) Apply(log *raft.Log) interface{} {
 			case "SET":
 				err = txn.Set([]byte(cmd.Key), cmd.Value)
 				result = "OK"
-			case "DEL":
+			case "DEL", "DELETE":
 				err = txn.Delete([]byte(cmd.Key))
+				result = "OK"
+			case "BATCH_SET":
+				// 解码批量数据
+				var pairs []KeyValue
+				if err := gob.NewDecoder(bytes.NewReader(cmd.Data)).Decode(&pairs); err != nil {
+					return fmt.Errorf("failed to decode batch set: %v", err)
+				}
+				// 用 WriteBatch 批量写
+				wb := s.db.NewWriteBatch()
+				defer wb.Cancel()
+				for _, kv := range pairs {
+					if err := wb.Set([]byte(kv.Key), []byte(kv.Value)); err != nil {
+						return err
+					}
+				}
+				if err := wb.Flush(); err != nil {
+					return err
+				}
 				result = "OK"
 			default:
 				return fmt.Errorf("unknown command: %s", cmd.Op)
@@ -98,9 +121,6 @@ func (s *BadgerStore) Apply(log *raft.Log) interface{} {
 
 // Snapshot returns a snapshot of the FSM
 func (s *BadgerStore) Snapshot() (raft.FSMSnapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	return &BadgerSnapshot{
 		db:  s.db,
 		log: s.log,
@@ -109,9 +129,6 @@ func (s *BadgerStore) Snapshot() (raft.FSMSnapshot, error) {
 
 // Restore restores the FSM from a snapshot
 func (s *BadgerStore) Restore(rc io.ReadCloser) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// Clear existing data
 	err := s.db.DropAll()
 	if err != nil {
@@ -179,9 +196,6 @@ func (s *BadgerStore) Restore(rc io.ReadCloser) error {
 
 // Get retrieves a value by key
 func (s *BadgerStore) Get(key string) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var value []byte
 	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(key))
@@ -205,29 +219,25 @@ func (s *BadgerStore) Get(key string) ([]byte, error) {
 
 // Set sets a key-value pair
 func (s *BadgerStore) Set(key string, value []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte(key), value)
 	})
 }
 
 // Delete deletes a key
-func (s *BadgerStore) Delete(key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *BadgerStore) Delete(key string, errorOnNotExists bool) error {
 	return s.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete([]byte(key))
+		err := txn.Delete([]byte(key))
+		if err == badger.ErrKeyNotFound && errorOnNotExists {
+			return err
+		}
+		// 其他情况（包括 errorOnNotExists==false 或 key 存在），都返回 nil
+		return nil
 	})
 }
 
 // Scan performs a range scan
 func (s *BadgerStore) Scan(prefix string, limit int) (map[string][]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	result := make(map[string][]byte)
 	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -244,11 +254,10 @@ func (s *BadgerStore) Scan(prefix string, limit int) (map[string][]byte, error) 
 
 			item := it.Item()
 			key := string(item.Key())
-			
-					// Skip internal data (__dcache namespace)
-		if strings.HasPrefix(key, InternalNamespace) {
-			continue
-		}
+			// Skip internal data (__dcache namespace)
+			if strings.HasPrefix(key, InternalNamespace) {
+				continue
+			}
 
 			value, err := item.ValueCopy(nil)
 			if err != nil {
@@ -274,30 +283,36 @@ func (s *BadgerStore) Close() error {
 }
 
 // Command represents a cache operation
+// 支持批量写时，Op=BATCH_SET，Data为gob编码的[]KeyValue
+// 单条写时，Op/Key/Value有效
 type Command struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
 	Value []byte `json:"value,omitempty"`
+	Data  []byte `json:"data,omitempty"` // 批量写时存储gob编码的[]KeyValue
 }
 
-// parseCommand parses a command from log data
+// parseCommand 支持解析 BATCH_SET，Data 字段直接赋值
 func (s *BadgerStore) parseCommand(data []byte) (*Command, error) {
-	// Simple command format: "OP:KEY:VALUE"
+	// 新格式: gob编码Command结构体
+	var cmd Command
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&cmd); err == nil && cmd.Op != "" {
+		return &cmd, nil
+	}
+	// 兼容老格式: "OP:KEY:VALUE"
 	parts := bytes.Split(data, []byte(":"))
 	if len(parts) < 2 {
 		return nil, fmt.Errorf("invalid command format")
 	}
-
-	cmd := &Command{
+	cmd = Command{
 		Op:  string(parts[0]),
 		Key: string(parts[1]),
 	}
-
 	if len(parts) > 2 {
 		cmd.Value = parts[2]
 	}
-
-	return cmd, nil
+	return &cmd, nil
 }
 
 // BadgerSnapshot implements raft.FSMSnapshot
@@ -371,6 +386,19 @@ func (s *BadgerSnapshot) Persist(sink raft.SnapshotSink) error {
 // Release releases the snapshot
 func (s *BadgerSnapshot) Release() {
 	// Nothing to do for BadgerDB snapshots
+}
+
+// BatchSet sets multiple key-value pairs efficiently using BadgerDB WriteBatch
+func (s *BadgerStore) BatchSet(pairs []KeyValue) error {
+	wb := s.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	for _, kv := range pairs {
+		if err := wb.Set([]byte(kv.Key), []byte(kv.Value)); err != nil {
+			return err
+		}
+	}
+	return wb.Flush()
 }
 
 // 实现 raft.LogStore 和 raft.StableStore

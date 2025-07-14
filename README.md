@@ -162,8 +162,8 @@ Set a key-value pair.
 #### DELETE /api/v1/delete/{key}
 Delete a key.
 
-#### GET /api/v1/scan?prefix={prefix}&limit={limit}
-Scan keys with a prefix.
+#### GET /api/v1/keys?prefix={prefix}&limit={limit}
+Range scan keys with a prefix.
 
 ### Cluster Operations
 
@@ -193,8 +193,8 @@ Join an existing cluster.
 # Delete a key
 ./bin/dcache-client delete key1
 
-# Scan with prefix
-./bin/dcache-client scan user:
+# Range scan with prefix
+./bin/dcache-client range-scan user:
 
 # Get cluster status
 ./bin/dcache-client status

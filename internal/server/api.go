@@ -12,6 +12,7 @@ import (
 
 	"dcache/internal/config"
 	"dcache/internal/raft"
+	"dcache/internal/storage"
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
@@ -40,22 +41,34 @@ func NewAPI(raftManager *raft.Manager, cfg *config.Config, log *logrus.Logger) *
 
 // setupRoutes sets up the API routes
 func (api *API) setupRoutes() {
-	// Cache operations
-	api.Router.HandleFunc("/api/v1/get/{key}", api.handleGet).Methods("GET")
-	api.Router.HandleFunc("/api/v1/set", api.handleSet).Methods("POST")
-	api.Router.HandleFunc("/api/v1/delete/{key}", api.handleDelete).Methods("DELETE")
-	api.Router.HandleFunc("/api/v1/scan", api.handleScan).Methods("GET")
+	// KV operations (RESTful)
+	api.Router.HandleFunc("/api/v1/keys/{key}", api.handleGetKey).Methods("GET")
+	api.Router.HandleFunc("/api/v1/keys/{key}", api.handlePutKey).Methods("PUT")
+	api.Router.HandleFunc("/api/v1/keys/{key}", api.handleDelete).Methods("DELETE")
+	api.Router.HandleFunc("/api/v1/keys", api.handleRangeScan).Methods("GET")
+	
+	// Batch operations with query parameter to distinguish from range scan
+	api.Router.HandleFunc("/api/v1/keys", api.handleBatchSet).Methods("POST")
+	api.Router.HandleFunc("/api/v1/keys", api.handleBatchSet).Methods("PUT")
+	api.Router.HandleFunc("/api/v1/keys", api.handleBatchGet).Methods("GET")
+	api.Router.HandleFunc("/api/v1/keys", api.handleBatchDelete).Methods("DELETE")
+
+	// Node operations
+	api.Router.HandleFunc("/api/v1/node/health", api.handleHealth).Methods("GET")
+	api.Router.HandleFunc("/api/v1/node/leader", api.handleGetLeader).Methods("GET")
+	api.Router.HandleFunc("/api/v1/node/transfer-leadership", api.handleTransferLeadership).Methods("POST")
 
 	// Cluster operations
 	api.Router.HandleFunc("/api/v1/cluster/status", api.handleClusterStatus).Methods("GET")
-	api.Router.HandleFunc("/api/v1/cluster/leader", api.handleGetLeader).Methods("GET")
-	api.Router.HandleFunc("/api/v1/cluster/transfer-leadership", api.handleTransferLeadership).Methods("POST")
 	api.Router.HandleFunc("/api/v1/cluster/join", api.handleJoinCluster).Methods("POST")
 	api.Router.HandleFunc("/api/v1/cluster/add-node", api.handleAddNode).Methods("POST")
 	api.Router.HandleFunc("/api/v1/cluster/remove-node", api.handleRemoveNode).Methods("POST")
+	api.Router.HandleFunc("/api/v1/cluster/members", api.handleGetMembers).Methods("GET")
 
-	// Health check
-	api.Router.HandleFunc("/health", api.handleHealth).Methods("GET")
+	// Legacy batch operations (for backward compatibility)
+	api.Router.HandleFunc("/api/v1/batch/set", api.handleBatchSet).Methods("POST")
+	api.Router.HandleFunc("/api/v1/batch/get", api.handleBatchGet).Methods("POST")
+	api.Router.HandleFunc("/api/v1/batch/delete", api.handleBatchDelete).Methods("POST")
 }
 
 // Start starts the API server
@@ -70,6 +83,87 @@ type Response struct {
 	Data    interface{} `json:"data,omitempty"`
 	Error   string      `json:"error,omitempty"`
 }
+
+// KVResponse represents a KV operation response (without success field)
+type KVResponse struct {
+	Data interface{} `json:"data,omitempty"`
+	Error string     `json:"error,omitempty"`
+}
+
+// KVHeader represents KV operation response header
+type KVHeader struct {
+	ClusterID string `json:"cluster_id"`
+	NodeID    string `json:"node_id"`
+	Revision  uint64 `json:"revision"`
+	RaftTerm  uint64 `json:"raft_term"`
+}
+
+// KVItem represents key-value pair
+type KVItem struct {
+	Key            string `json:"key"`
+	Value          string `json:"value"`
+	CreateRevision uint64 `json:"create_revision"`
+	ModRevision    uint64 `json:"mod_revision"`
+	Version        uint64 `json:"version"`
+}
+
+// GetResponse represents GET response
+type GetResponse struct {
+	Header       KVHeader   `json:"header"`
+	KVs          []KVItem   `json:"kvs"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Code         int        `json:"code"`
+	Error        string     `json:"error,omitempty"`
+}
+
+// PutResponse represents PUT/SET response
+type PutResponse struct {
+	Header       KVHeader   `json:"header"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Code         int        `json:"code"`
+	Error        string     `json:"error,omitempty"`
+}
+
+// DeleteResponse represents DELETE response
+type DeleteResponse struct {
+	Header       KVHeader   `json:"header"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Code         int        `json:"code"`
+	Error        string     `json:"error,omitempty"`
+}
+
+// ScanResponse represents SCAN response
+type ScanResponse struct {
+	Header       KVHeader   `json:"header"`
+	KVs          []KVItem   `json:"kvs"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Code         int        `json:"code"`
+	Error        string     `json:"error,omitempty"`
+}
+
+// ErrorResponse represents error response
+type ErrorResponse struct {
+	Error string `json:"error"`
+	Code  int    `json:"code"`
+}
+
+// 应用级别的错误码定义
+const (
+	ErrorCodeOK              = 0
+	ErrorCodeInvalidArgument = 3
+	ErrorCodeNotFound        = 5
+	ErrorCodeNotLeader       = 9
+	ErrorCodeInternal        = 13
+	ErrorCodeBatchPartial    = 100
+)
 
 // SetRequest represents a set operation request
 type SetRequest struct {
@@ -93,165 +187,268 @@ type ClusterStatus struct {
 	Index     uint64 `json:"index"`
 }
 
-// handleGet handles GET requests
-func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
+// ClusterMember represents a cluster member
+type ClusterMember struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Role     string `json:"role"`
+	Address  string `json:"address"`
+}
+
+// Batch operations
+type BatchSetRequest struct {
+	Pairs []KeyValue `json:"pairs"`
+}
+
+type BatchGetRequest struct {
+	Keys []string `json:"keys"`
+}
+
+type BatchDeleteRequest struct {
+	Keys []string `json:"keys"`
+	ErrorOnNotExists bool `json:"error_on_not_exists"`
+}
+
+type KeyValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type BatchResponse struct {
+	Header       KVHeader   `json:"header"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Data         interface{} `json:"data,omitempty"`
+	Code         int        `json:"code"` // Added for partial success
+}
+
+// RangeScanResponse represents RANGE SCAN response
+type RangeScanResponse struct {
+	Header       KVHeader   `json:"header"`
+	KVs          []KVItem   `json:"kvs"`
+	SuccessCount int        `json:"success_count"`
+	ErrorCount   int        `json:"error_count"`
+	Errors       []string   `json:"errors,omitempty"`
+	Code         int        `json:"code"`
+	Error        string     `json:"error,omitempty"`
+}
+
+// RangeScanRequest represents a range scan operation request
+type RangeScanRequest struct {
+	Prefix string `json:"prefix"`
+	Limit  int    `json:"limit"`
+}
+
+// handleGetKey godoc
+// @Summary 获取单个key
+// @Description 获取指定key的值
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   key  path  string  true  "键"
+// @Success 200 {object} GetResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 400 {object} ErrorResponse
+// @Router /api/v1/keys/{key} [get]
+func (api *API) handleGetKey(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
 
-	// Check if this node is the leader
 	if !api.raftManager.IsLeader() {
-		// Forward to leader
 		if err := api.forwardToLeader(w, r); err != nil {
 			api.log.Errorf("Failed to forward GET request to leader: %v", err)
-			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+			api.writeKVError(w, http.StatusServiceUnavailable, "Failed to forward to leader")
 		}
 		return
 	}
 
 	value, err := api.raftManager.Get(key)
 	if err != nil {
-		api.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get key: %v", err))
+		api.writeKVError(w, http.StatusInternalServerError, "Failed to get key")
 		return
 	}
 
 	if value == "" {
-		api.writeResponse(w, http.StatusNotFound, Response{
-			Success: false,
-			Error:   "Key not found",
-		})
+		api.writeKVError(w, http.StatusNotFound, "Key not found")
 		return
 	}
 
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data: map[string]string{
-			"key":   key,
-			"value": string(value),
-		},
-	})
+	header := api.getKVHeader()
+	response := GetResponse{
+		Header:       header,
+		KVs:          []KVItem{{Key: key, Value: value, CreateRevision: 0, ModRevision: 0, Version: 1}},
+		SuccessCount: 1,
+		ErrorCount:   0,
+		Code:         ErrorCodeOK,
+	}
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
-// handleSet handles SET requests
-func (api *API) handleSet(w http.ResponseWriter, r *http.Request) {
-	// Check if this node is the leader first
+// handlePutKey godoc
+// @Summary 写入/更新单个key
+// @Description 写入/更新指定key的值
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   key  path  string  true  "键"
+// @Param   value body SetRequest true "值"
+// @Success 200 {object} PutResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/keys/{key} [put]
+func (api *API) handlePutKey(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["key"]
+
 	if !api.raftManager.IsLeader() {
-		// Forward to leader without parsing request body
 		if err := api.forwardToLeader(w, r); err != nil {
-			api.log.Errorf("Failed to forward SET request to leader: %v", err)
-			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+			api.log.Errorf("Failed to forward PUT request to leader: %v", err)
+			api.writeKVError(w, http.StatusServiceUnavailable, "Failed to forward to leader")
 		}
 		return
 	}
 
-	// Only parse request body if this is the leader
 	var req SetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		api.writeError(w, http.StatusBadRequest, "Invalid request body")
+		api.writeKVError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	if req.Key == "" {
-		api.writeError(w, http.StatusBadRequest, "Key is required")
+	if req.Value == "" {
+		api.writeKVError(w, http.StatusBadRequest, "Value is required")
 		return
 	}
 
-	err := api.raftManager.Set(req.Key, []byte(req.Value))
+	err := api.raftManager.Set(key, []byte(req.Value))
 	if err != nil {
-		api.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to set key: %v", err))
+		api.writeKVError(w, http.StatusInternalServerError, "Failed to set key")
 		return
 	}
 
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data:    "OK",
-	})
+	header := api.getKVHeader()
+	response := PutResponse{
+		Header:       header,
+		SuccessCount: 1,
+		ErrorCount:   0,
+		Code:         ErrorCodeOK,
+	}
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
-// handleDelete handles DELETE requests
+// handleDelete godoc
+// @Summary 删除单个key
+// @Description 删除指定key
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   key  path  string  true  "键"
+// @Success 200 {object} DeleteResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/keys/{key} [delete]
 func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
 
-	// Check if this node is the leader
+	errorOnNotExists := false
+	if errorOnNotExistsStr := r.URL.Query().Get("error_on_not_exists"); errorOnNotExistsStr != "" {
+		if errorOnNotExistsStr == "true" || errorOnNotExistsStr == "1" {
+			errorOnNotExists = true
+		}
+	}
+
 	if !api.raftManager.IsLeader() {
-		// Forward to leader
 		if err := api.forwardToLeader(w, r); err != nil {
 			api.log.Errorf("Failed to forward DELETE request to leader: %v", err)
-			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+			api.writeKVError(w, http.StatusServiceUnavailable, "Failed to forward to leader")
 		}
 		return
 	}
 
-	err := api.raftManager.Delete(key)
+	err := api.raftManager.Delete(key, errorOnNotExists)
 	if err != nil {
-		api.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete key: %v", err))
+		if err.Error() == "key not found" {
+			api.writeKVError(w, http.StatusNotFound, "Key not found")
+		} else {
+			api.writeKVError(w, http.StatusInternalServerError, "Failed to delete key")
+		}
 		return
 	}
 
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data:    "OK",
-	})
+	header := api.getKVHeader()
+	response := DeleteResponse{
+		Header:       header,
+		SuccessCount: 1,
+		ErrorCount:   0,
+		Code:         ErrorCodeOK,
+	}
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
-// handleScan handles SCAN requests
-func (api *API) handleScan(w http.ResponseWriter, r *http.Request) {
+// handleRangeScan handles GET /api/v1/keys?prefix=xxx&limit=xxx
+func (api *API) handleRangeScan(w http.ResponseWriter, r *http.Request) {
 	prefix := r.URL.Query().Get("prefix")
 	limitStr := r.URL.Query().Get("limit")
-	
-	limit := 100 // default limit
+	limit := 100
 	if limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil {
 			limit = l
 		}
 	}
-
-	// Check if this node is the leader
 	if !api.raftManager.IsLeader() {
-		// Forward to leader
 		if err := api.forwardToLeader(w, r); err != nil {
-			api.log.Errorf("Failed to forward SCAN request to leader: %v", err)
+			api.log.Errorf("Failed to forward RANGE SCAN request to leader: %v", err)
 			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
 		}
 		return
 	}
-
 	result, err := api.raftManager.Scan(prefix, limit)
 	if err != nil {
-		api.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to scan: %v", err))
+		api.writeKVError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to range scan: %v", err))
 		return
 	}
-
-	// Convert result to string map
-	stringResult := make(map[string]string)
+	var kvs []KVItem
 	for _, kv := range result {
-		stringResult[kv.Key] = kv.Value
+		kvs = append(kvs, KVItem{Key: kv.Key, Value: kv.Value, CreateRevision: 0, ModRevision: 0, Version: 1})
 	}
-
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data: map[string]interface{}{
-			"prefix": prefix,
-			"limit":  limit,
-			"count":  len(stringResult),
-			"items":  stringResult,
-		},
-	})
+	header := api.getKVHeader()
+	response := RangeScanResponse{
+		Header:       header, 
+		KVs:          kvs, 
+		SuccessCount: len(kvs),
+		ErrorCount:   0,
+		Code:         ErrorCodeOK,
+	}
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
 // handleClusterStatus handles cluster status requests
 func (api *API) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
-	status := ClusterStatus{
-		NodeID:   api.config.GetNodeID(),
-		State:    api.raftManager.GetState().String(),
-		IsLeader: api.raftManager.IsLeader(),
-		Leader:   api.raftManager.GetLeader(),
+	header := api.getKVHeader()
+	leader := api.raftManager.GetLeader()
+	nodes := api.raftManager.GetNodes()
+	isLeader := api.raftManager.IsLeader()
+
+	// 构建节点列表
+	var nodeList []string
+	for _, node := range nodes {
+		nodeList = append(nodeList, string(node))
 	}
 
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data:    status,
-	})
+	response := struct {
+		Header   KVHeader `json:"header"`
+		Leader   string   `json:"leader"`
+		Nodes    []string `json:"nodes"`
+		IsLeader bool     `json:"is_leader"`
+	}{
+		Header:   header,
+		Leader:   leader,
+		Nodes:    nodeList,
+		IsLeader: isLeader,
+	}
+
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
 // handleGetLeader handles get leader requests
@@ -411,12 +608,267 @@ func (api *API) handleRemoveNode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBatchSet godoc
+// @Summary 批量写入/更新
+// @Description 批量写入/更新多个key
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   pairs  body  []KeyValue  true  "键值对数组"
+// @Success 200 {object} BatchResponse
+// @Failure 400 {object} ErrorResponse
+// @Router /api/v1/keys [post]
+func (api *API) handleBatchSet(w http.ResponseWriter, r *http.Request) {
+	// Check if this node is the leader
+	if !api.raftManager.IsLeader() {
+		// Forward to leader
+		if err := api.forwardToLeader(w, r); err != nil {
+			api.log.Errorf("Failed to forward BATCH_SET request to leader: %v", err)
+			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+		}
+		return
+	}
+
+	// Parse JSON request
+	var req BatchSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.writeError(w, http.StatusBadRequest, "Invalid JSON request")
+		return
+	}
+
+	if len(req.Pairs) == 0 {
+		api.writeError(w, http.StatusBadRequest, "pairs array cannot be empty")
+		return
+	}
+
+	// 类型转换
+	pairs := make([]storage.KeyValue, len(req.Pairs))
+	for i, kv := range req.Pairs {
+		pairs[i] = storage.KeyValue{Key: kv.Key, Value: kv.Value}
+	}
+	err := api.raftManager.BatchSet(pairs)
+	successCount := 0
+	errorCount := 0
+	var errors []string
+	if err != nil {
+		errors = append(errors, err.Error())
+		errorCount = len(req.Pairs)
+	} else {
+		successCount = len(req.Pairs)
+	}
+
+	// 创建KV操作响应
+	header := api.getKVHeader()
+	response := BatchResponse{
+		Header:       header,
+		SuccessCount: successCount,
+		ErrorCount:   errorCount,
+		Errors:       errors,
+	}
+
+	statusCode := http.StatusOK
+	respCode := ErrorCodeOK
+	if errorCount > 0 {
+		statusCode = http.StatusPartialContent
+		respCode = ErrorCodeBatchPartial
+	}
+	response.Code = respCode
+	api.writeKVResponse(w, statusCode, response)
+}
+
+// handleBatchGet handles GET /api/v1/keys (batch get or range scan)
+func (api *API) handleBatchGet(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a batch get (has request body) or range scan (has query params)
+	if r.Body != nil && r.ContentLength > 0 {
+		// This is a batch get operation
+		api.handleBatchGetOperation(w, r)
+	} else {
+		// This is a range scan operation
+		api.handleRangeScan(w, r)
+	}
+}
+
+// handleBatchGetOperation godoc
+// @Summary 批量获取
+// @Description 批量获取多个key
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   keys  body  []string  true  "key数组"
+// @Success 200 {object} BatchResponse
+// @Failure 400 {object} ErrorResponse
+// @Router /api/v1/keys [get]
+func (api *API) handleBatchGetOperation(w http.ResponseWriter, r *http.Request) {
+	// Check if this node is the leader
+	if !api.raftManager.IsLeader() {
+		// Forward to leader
+		if err := api.forwardToLeader(w, r); err != nil {
+			api.log.Errorf("Failed to forward BATCH_GET request to leader: %v", err)
+			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+		}
+		return
+	}
+
+	// Parse JSON request
+	var req BatchGetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.writeError(w, http.StatusBadRequest, "Invalid JSON request")
+		return
+	}
+
+	if len(req.Keys) == 0 {
+		api.writeError(w, http.StatusBadRequest, "keys array cannot be empty")
+		return
+	}
+
+	var pairs []KeyValue
+	var errors []string
+	successCount := 0
+	errorCount := 0
+
+	// Get all values
+	for _, key := range req.Keys {
+		if key == "" {
+			errors = append(errors, "key cannot be empty")
+			errorCount++
+			continue
+		}
+
+		value, err := api.raftManager.Get(key)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("failed to get %s: %v", key, err))
+			errorCount++
+		} else if value == "" {
+			errors = append(errors, fmt.Sprintf("key %s not found", key))
+			errorCount++
+		} else {
+			pairs = append(pairs, KeyValue{Key: key, Value: value})
+			successCount++
+		}
+	}
+
+	// 创建KV操作响应
+	header := api.getKVHeader()
+	response := BatchResponse{
+		Header:       header,
+		SuccessCount: successCount,
+		ErrorCount:   errorCount,
+		Errors:       errors,
+		Data:         pairs,
+	}
+
+	statusCode := http.StatusOK
+	respCode := ErrorCodeOK
+	if errorCount > 0 {
+		statusCode = http.StatusPartialContent
+		respCode = ErrorCodeBatchPartial
+	}
+	response.Code = respCode
+	api.writeKVResponse(w, statusCode, response)
+}
+
+// handleBatchDelete godoc
+// @Summary 批量删除
+// @Description 批量删除多个key
+// @Tags KV
+// @Accept  json
+// @Produce  json
+// @Param   keys  body  []string  true  "key数组"
+// @Success 200 {object} BatchResponse
+// @Failure 400 {object} ErrorResponse
+// @Router /api/v1/keys [delete]
+func (api *API) handleBatchDelete(w http.ResponseWriter, r *http.Request) {
+	// Check if this node is the leader
+	if !api.raftManager.IsLeader() {
+		// Forward to leader
+		if err := api.forwardToLeader(w, r); err != nil {
+			api.log.Errorf("Failed to forward BATCH_DELETE request to leader: %v", err)
+			api.writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Failed to forward to leader: %v", err))
+		}
+		return
+	}
+
+	// Parse JSON request
+	var req BatchDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.writeError(w, http.StatusBadRequest, "Invalid JSON request")
+		return
+	}
+
+	if len(req.Keys) == 0 {
+		api.writeError(w, http.StatusBadRequest, "keys array cannot be empty")
+		return
+	}
+
+	var errors []string
+	successCount := 0
+	errorCount := 0
+
+	// Apply all delete operations to Raft
+	for _, key := range req.Keys {
+		if key == "" {
+			errors = append(errors, "key cannot be empty")
+			errorCount++
+			continue
+		}
+
+		err := api.raftManager.Delete(key, req.ErrorOnNotExists)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("failed to delete %s: %v", key, err))
+			errorCount++
+		} else {
+			successCount++
+		}
+	}
+
+	// 创建KV操作响应
+	header := api.getKVHeader()
+	response := BatchResponse{
+		Header:       header,
+		SuccessCount: successCount,
+		ErrorCount:   errorCount,
+		Errors:       errors,
+	}
+
+	statusCode := http.StatusOK
+	respCode := ErrorCodeOK
+	if errorCount > 0 {
+		statusCode = http.StatusPartialContent
+		respCode = ErrorCodeBatchPartial
+	}
+	response.Code = respCode
+	api.writeKVResponse(w, statusCode, response)
+}
+
 // handleHealth handles health check requests
 func (api *API) handleHealth(w http.ResponseWriter, r *http.Request) {
-	api.writeResponse(w, http.StatusOK, Response{
-		Success: true,
-		Data:    "OK",
-	})
+	header := api.getKVHeader()
+	
+	// Check if Raft is healthy
+	if !api.raftManager.IsHealthy() {
+		api.writeKVError(w, http.StatusServiceUnavailable, "raft is not healthy")
+		return
+	}
+
+	// Determine node role
+	var role string
+	if api.raftManager.IsLeader() {
+		role = "leader"
+	} else {
+		role = "follower"
+	}
+
+	response := struct {
+		Header KVHeader `json:"header"`
+		Status string   `json:"status"`
+		Role   string   `json:"role"`
+	}{
+		Header: header,
+		Status: "healthy",
+		Role:   role,
+	}
+
+	api.writeKVResponse(w, http.StatusOK, response)
 }
 
 // writeResponse writes a JSON response
@@ -515,10 +967,150 @@ func (api *API) forwardToLeader(w http.ResponseWriter, r *http.Request) error {
 	return err
 }
 
+// getNodeIDAsNumber converts node name to numeric ID
+func (api *API) getNodeIDAsNumber() string {
+	nodeName := api.config.GetNodeID()
+	
+	// 简单的转换规则：node1 -> 1, node2 -> 2, node3 -> 3
+	if strings.HasPrefix(nodeName, "node") {
+		if len(nodeName) > 4 {
+			return nodeName[4:] // 提取数字部分
+		}
+	}
+	
+	// 如果不是标准格式，返回原始名称
+	return nodeName
+}
+
+// getKVHeader creates a KV operation response header
+func (api *API) getKVHeader() KVHeader {
+	// 从配置中获取cluster_id和node_id
+	clusterID := api.config.ClusterID
+	nodeID := api.getNodeIDAsNumber() // 使用数字ID
+	
+	// 获取raft的当前term和index
+	raftTerm := uint64(0)
+	revision := uint64(0)
+	
+	// 这里可以从raft manager获取更多信息
+	// 暂时使用默认值，后续可以扩展
+	
+	// 确保cluster_id不为空
+	if clusterID == "" {
+		clusterID = "dcache-cluster" // 默认值
+	}
+	
+	return KVHeader{
+		ClusterID: clusterID,
+		NodeID:    nodeID,
+		Revision:  revision,
+		RaftTerm:  raftTerm,
+	}
+}
+
+// writeKVResponse writes a KV operation JSON response
+func (api *API) writeKVResponse(w http.ResponseWriter, statusCode int, response interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(response)
+}
+
+// writeKVErrorWithCode writes a standardized error response with a specific code
+func (api *API) writeKVErrorWithCode(w http.ResponseWriter, statusCode int, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(ErrorResponse{
+		Error: message,
+		Code:  code,
+	})
+}
+
+// 修改 writeKVError 使用细化的错误码
+func (api *API) writeKVError(w http.ResponseWriter, statusCode int, message string) {
+	var errorCode int
+	switch statusCode {
+	case http.StatusNotFound:
+		errorCode = ErrorCodeNotFound
+	case http.StatusBadRequest:
+		errorCode = ErrorCodeInvalidArgument
+	case http.StatusServiceUnavailable:
+		errorCode = ErrorCodeNotLeader
+	default:
+		errorCode = ErrorCodeInternal
+	}
+	
+	// 创建包含header的错误响应
+	header := api.getKVHeader()
+	errorResponse := struct {
+		Header       KVHeader `json:"header"`
+		SuccessCount int      `json:"success_count"`
+		ErrorCount   int      `json:"error_count"`
+		Code         int      `json:"code"`
+		Error        string   `json:"error"`
+	}{
+		Header:       header,
+		SuccessCount: 0,
+		ErrorCount:   1,
+		Code:         errorCode,
+		Error:        message,
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(errorResponse)
+}
+
 // writeError writes an error response
 func (api *API) writeError(w http.ResponseWriter, statusCode int, message string) {
 	api.writeResponse(w, statusCode, Response{
 		Success: false,
 		Error:   message,
 	})
+}
+
+// handleGetMembers handles GET /api/v1/cluster/members requests
+func (api *API) handleGetMembers(w http.ResponseWriter, r *http.Request) {
+	header := api.getKVHeader()
+	
+	// Get cluster configuration
+	conf := api.raftManager.GetConfiguration()
+	var members []ClusterMember
+	
+	for _, server := range conf.Servers {
+		// Determine role
+		var role string
+		if string(server.ID) == api.config.GetNodeID() && api.raftManager.IsLeader() {
+			role = "leader"
+		} else if string(server.ID) == api.config.GetNodeID() {
+			role = "follower"
+		} else {
+			// For other nodes, we can't determine their exact role from this node
+			// They could be leader or follower
+			role = "unknown"
+		}
+		
+		// Extract node ID from server ID
+		nodeID := string(server.ID)
+		if strings.HasPrefix(nodeID, "node") && len(nodeID) > 4 {
+			nodeID = nodeID[4:] // Extract numeric part
+		}
+		
+		member := ClusterMember{
+			NodeID:   nodeID,
+			NodeName: string(server.ID),
+			Role:     role,
+			Address:  string(server.Address),
+		}
+		members = append(members, member)
+	}
+	
+	response := struct {
+		Header  KVHeader        `json:"header"`
+		Members []ClusterMember `json:"members"`
+	}{
+		Header:  header,
+		Members: members,
+	}
+	
+	api.writeKVResponse(w, http.StatusOK, response)
 } 

@@ -6,14 +6,16 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"dcache/internal/config"
 	"dcache/internal/raft"
+	"path/filepath"
+	"github.com/gofrs/flock"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"github.com/soheilhy/cmux"
+	"google.golang.org/grpc/reflection"
 )
 
 // Server represents the main server
@@ -25,6 +27,7 @@ type Server struct {
 	log         *logrus.Logger
 	httpServer  *http.Server
 	grpcServer2 *grpc.Server
+	lockFile    *flock.Flock
 }
 
 // New creates a new server instance
@@ -34,9 +37,27 @@ func New(cfg *config.Config) (*Server, error) {
 		FullTimestamp: true,
 	})
 
+	// Data-dir lock: 防止多进程写同一目录（仅在 persistent 模式下）
+	var lock *flock.Flock
+	if cfg.DataDir != "" && cfg.StorageMode == "persistent" {
+		lockPath := filepath.Join(cfg.DataDir, ".lock")
+		lock = flock.New(lockPath)
+		locked, err := lock.TryLock()
+		if err != nil {
+			return nil, fmt.Errorf("failed to lock data-dir: %v", err)
+		}
+		if !locked {
+			return nil, fmt.Errorf("data-dir %s is already locked by another process", cfg.DataDir)
+		}
+		log.Infof("Locked data-dir: %s", cfg.DataDir)
+	}
+
 	// Create Raft manager
 	raftManager, err := raft.NewManager(cfg, log)
 	if err != nil {
+		if lock != nil {
+			_ = lock.Unlock()
+		}
 		return nil, fmt.Errorf("failed to create raft manager: %v", err)
 	}
 
@@ -52,6 +73,7 @@ func New(cfg *config.Config) (*Server, error) {
 		api:         api,
 		grpcServer:  grpcServer,
 		log:         log,
+		lockFile:    lock,
 	}, nil
 }
 
@@ -85,8 +107,8 @@ func (s *Server) Start() error {
 	s.grpcServer2 = grpc.NewServer()
 	s.grpcServer.Register(s.grpcServer2)
 	
-	// 确保 gRPC server 支持 HTTP/2
-	s.log.Infof("gRPC server created with HTTP/2 support")
+	// 启用 gRPC 反射服务
+	reflection.Register(s.grpcServer2)
 	
 	// 3. 创建 HTTP mux
 	hmux := http.NewServeMux()
@@ -107,12 +129,7 @@ func (s *Server) Start() error {
 		}
 	}()
 	
-	// 等待一小段时间让 gRPC server 启动
-	time.Sleep(100 * time.Millisecond)
-	s.log.Infof("gRPC server should be ready on %s", clientAddr)
 	
-	// 测试 gRPC server 是否正在监听
-	s.log.Infof("Testing gRPC server readiness...")
 
 	// 6. 启动 HTTP server
 	s.httpServer = &http.Server{
@@ -125,27 +142,102 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	s.log.Infof("Starting cmux on %s", clientAddr)
 	return mux.Serve()
 }
 
-// Stop stops the server
+// Stop stops the server gracefully with timeout
 func (s *Server) Stop() error {
-	s.log.Info("Stopping server...")
+	return s.StopWithContext(context.Background())
+}
+
+// StopWithContext stops the server gracefully with context timeout
+func (s *Server) StopWithContext(ctx context.Context) error {
+	s.log.Info("Stopping server gracefully...")
+	
+	// Create error channel to collect shutdown errors
+	errChan := make(chan error, 3)
+	
+	// Stop HTTP server
 	if s.httpServer != nil {
-		if err := s.httpServer.Shutdown(context.Background()); err != nil {
-			s.log.Errorf("Failed to shutdown HTTP server: %v", err)
-		}
+		go func() {
+			if err := s.httpServer.Shutdown(ctx); err != nil {
+				s.log.Errorf("Failed to shutdown HTTP server: %v", err)
+				errChan <- fmt.Errorf("HTTP server shutdown error: %v", err)
+			} else {
+				s.log.Info("HTTP server stopped gracefully")
+				errChan <- nil
+			}
+		}()
+	} else {
+		errChan <- nil
 	}
+	
+	// Stop gRPC server
 	if s.grpcServer2 != nil {
-		s.grpcServer2.GracefulStop()
+		go func() {
+			// Create a channel for gRPC graceful stop
+			grpcDone := make(chan struct{})
+			go func() {
+				s.grpcServer2.GracefulStop()
+				close(grpcDone)
+			}()
+			
+			// Wait for gRPC to stop or context timeout
+			select {
+			case <-grpcDone:
+				s.log.Info("gRPC server stopped gracefully")
+				errChan <- nil
+			case <-ctx.Done():
+				s.log.Warn("gRPC graceful stop timeout, forcing stop")
+				s.grpcServer2.Stop()
+				errChan <- fmt.Errorf("gRPC server stop timeout")
+			}
+		}()
+	} else {
+		errChan <- nil
 	}
+	
+	// Stop Raft manager
 	if s.raftManager != nil {
-		if err := s.raftManager.Stop(); err != nil {
-			s.log.Errorf("Failed to stop raft manager: %v", err)
+		go func() {
+			if err := s.raftManager.Stop(); err != nil {
+				s.log.Errorf("Failed to stop raft manager: %v", err)
+				errChan <- fmt.Errorf("Raft manager stop error: %v", err)
+			} else {
+				s.log.Info("Raft manager stopped gracefully")
+				errChan <- nil
+			}
+		}()
+	} else {
+		errChan <- nil
+	}
+	
+	// Wait for all components to stop or context timeout
+	var errors []error
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				errors = append(errors, err)
+			}
+		case <-ctx.Done():
+			s.log.Warn("Shutdown timeout, some components may not have stopped gracefully")
+			return fmt.Errorf("shutdown timeout: %v", ctx.Err())
 		}
 	}
-	s.log.Info("Server stopped")
+	
+	if len(errors) > 0 {
+		s.log.Errorf("Server stopped with errors: %v", errors)
+		return fmt.Errorf("shutdown errors: %v", errors)
+	}
+	
+	s.log.Info("Server stopped gracefully")
+	
+	// 释放 data-dir lock
+	if s.lockFile != nil {
+		_ = s.lockFile.Unlock()
+		s.log.Info("Released data-dir lock")
+	}
 	return nil
 }
 

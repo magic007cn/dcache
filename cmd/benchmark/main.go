@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"io"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -108,10 +111,26 @@ type BenchmarkClient struct {
 }
 
 func NewBenchmarkClient(config *BenchmarkConfig) *BenchmarkClient {
+	// 配置 HTTP 连接池和复用 - 长连接优化配置
+	transport := &http.Transport{
+		MaxIdleConns:        100,             // 大幅增加最大空闲连接数
+		MaxIdleConnsPerHost: 100,             // 大幅增加每个主机的最大空闲连接数
+		IdleConnTimeout:     5 * time.Second, // 大幅增加空闲连接超时，保持长连接
+		DisableCompression:  true,             // 禁用压缩以提高性能
+		DisableKeepAlives:   false,            // 启用 Keep-Alive
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second, // 增加连接超时
+			KeepAlive: 5 * time.Second, // 大幅增加 Keep-Alive 间隔，保持长连接
+		}).DialContext,
+		ForceAttemptHTTP2: false, // 强制使用 HTTP/1.1
+		MaxConnsPerHost:   100,  // 大幅增加每个主机的最大连接数
+	}
+	
 	bc := &BenchmarkClient{
 		config: config,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   5 * time.Second, // 增加请求超时
+			Transport: transport,
 		},
 		logger: logrus.New(),
 	}
@@ -139,6 +158,19 @@ type Response struct {
 	Error   string      `json:"error,omitempty"`
 }
 
+// 通用API响应结构
+type APIResponse struct {
+	Header       struct{} `json:"header"`
+	SuccessCount int      `json:"success_count"`
+	ErrorCount   int      `json:"error_count"`
+	Code         int      `json:"code"`
+	Error        string   `json:"error"`
+	KVs          []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	} `json:"kvs"`
+}
+
 // benchmarkSet performs SET operation benchmark
 func (bc *BenchmarkClient) benchmarkSet(wg *sync.WaitGroup, resultChan chan<- *BenchmarkResult) {
 	defer wg.Done()
@@ -157,48 +189,52 @@ func (bc *BenchmarkClient) benchmarkSet(wg *sync.WaitGroup, resultChan chan<- *B
 			latency := time.Since(start)
 			if err != nil {
 				errors++
+				if errors <= 10 { // 只打印前10个错误，避免日志过多
+					fmt.Printf("gRPC SET error for key %s: %v\n", key, err)
+				}
 				continue
 			}
 			stats.Add(latency)
 			totalOps++
 		} else {
 			// HTTP
-			reqBody := SetRequest{Key: key, Value: value}
-			jsonData, _ := json.Marshal(reqBody)
+			// set: PUT /api/v1/keys/{key}，body只需value字段
+			jsonData, _ := json.Marshal(map[string]string{"value": value})
 			start := time.Now()
-			resp, err := bc.httpClient.Post(
-				fmt.Sprintf("http://%s/api/v1/set", bc.config.ServerAddr),
-				"application/json",
-				bytes.NewBuffer(jsonData),
-			)
+			req, _ := http.NewRequest("PUT", fmt.Sprintf("http://%s/api/v1/keys/%s", bc.config.ServerAddr, key), bytes.NewBuffer(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+			// 移除显式的 Connection: keep-alive 设置，使用 Go HTTP 客户端的默认行为
+			resp, err := bc.httpClient.Do(req)
 			latency := time.Since(start)
 			if err != nil {
 				errors++
+				if errors <= 10 {
+					fmt.Printf("HTTP SET network error for key %s: %v\n", key, err)
+				}
 				continue
 			}
-			if resp.StatusCode != http.StatusOK {
-				errors++
+			
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				var apiResp APIResponse
+				_ = json.NewDecoder(resp.Body).Decode(&apiResp)
 				resp.Body.Close()
-				continue
-			}
-			var apiResp Response
-			if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 				errors++
-				resp.Body.Close()
+				if errors <= 10 {
+					fmt.Printf("HTTP SET error for key %s: status=%d, error=%s, code=%d\n", 
+						key, resp.StatusCode, apiResp.Error, apiResp.Code)
+				}
 				continue
 			}
+			// 成功响应也需要读取并关闭，确保连接可复用
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
-			if !apiResp.Success {
-				errors++
-				continue
-			}
 			stats.Add(latency)
 			totalOps++
 		}
 	}
 	// Calculate statistics
 	min, max, avg, p50, p95, p99 := stats.Calculate()
-	
+	fmt.Printf("LOOP END: totalOps=%d, errors=%d\n", totalOps, errors)
 	result := &BenchmarkResult{
 		Operation:     "SET",
 		TotalOps:      totalOps,
@@ -213,7 +249,8 @@ func (bc *BenchmarkClient) benchmarkSet(wg *sync.WaitGroup, resultChan chan<- *B
 		Errors:        errors,
 		ErrorRate:     float64(errors) / float64(totalOps+errors) * 100,
 	}
-	
+	fmt.Printf("DEBUG: SET final stats - totalOps: %d, errors: %d, errorRate: %.2f%%\n", 
+		totalOps, errors, float64(errors) / float64(totalOps+errors) * 100)
 	resultChan <- result
 }
 
@@ -231,14 +268,12 @@ func (bc *BenchmarkClient) benchmarkGet(wg *sync.WaitGroup, resultChan chan<- *B
 		if bc.config.UseGrpc && bc.grpcClient != nil {
 			_, _ = bc.grpcClient.Set(ctx, &pb.SetRequest{Key: key, Value: value})
 		} else {
-			reqBody := SetRequest{Key: key, Value: value}
-			jsonData, _ := json.Marshal(reqBody)
-			resp, err := bc.httpClient.Post(
-				fmt.Sprintf("http://%s/api/v1/set", bc.config.ServerAddr),
-				"application/json",
-				bytes.NewBuffer(jsonData),
-			)
-			if err == nil && resp.StatusCode == http.StatusOK {
+			// HTTP 预置数据也用PUT
+			jsonData, _ := json.Marshal(map[string]string{"value": value})
+			req, _ := http.NewRequest("PUT", fmt.Sprintf("http://%s/api/v1/keys/%s", bc.config.ServerAddr, key), bytes.NewBuffer(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := bc.httpClient.Do(req)
+			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				resp.Body.Close()
 			}
 		}
@@ -259,26 +294,28 @@ func (bc *BenchmarkClient) benchmarkGet(wg *sync.WaitGroup, resultChan chan<- *B
 		} else {
 			start := time.Now()
 			resp, err := bc.httpClient.Get(
-				fmt.Sprintf("http://%s/api/v1/get/%s", bc.config.ServerAddr, key),
+				fmt.Sprintf("http://%s/api/v1/keys/%s", bc.config.ServerAddr, key),
 			)
 			latency := time.Since(start)
 			if err != nil {
 				errors++
 				continue
 			}
-			if resp.StatusCode != http.StatusOK {
-				errors++
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				var apiResp APIResponse
+				_ = json.NewDecoder(resp.Body).Decode(&apiResp)
 				resp.Body.Close()
+				errors++
 				continue
 			}
-			var apiResp Response
+			var apiResp APIResponse
 			if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-				errors++
 				resp.Body.Close()
+				errors++
 				continue
 			}
 			resp.Body.Close()
-			if !apiResp.Success {
+			if apiResp.Code != 0 || apiResp.SuccessCount == 0 || len(apiResp.KVs) == 0 {
 				errors++
 				continue
 			}
@@ -288,7 +325,6 @@ func (bc *BenchmarkClient) benchmarkGet(wg *sync.WaitGroup, resultChan chan<- *B
 	}
 	// Calculate statistics
 	min, max, avg, p50, p95, p99 := stats.Calculate()
-	
 	result := &BenchmarkResult{
 		Operation:     "GET",
 		TotalOps:      totalOps,
@@ -303,53 +339,44 @@ func (bc *BenchmarkClient) benchmarkGet(wg *sync.WaitGroup, resultChan chan<- *B
 		Errors:        errors,
 		ErrorRate:     float64(errors) / float64(totalOps+errors) * 100,
 	}
-	
 	resultChan <- result
 }
 
-// benchmarkScan performs SCAN operation benchmark
-func (bc *BenchmarkClient) benchmarkScan(wg *sync.WaitGroup, resultChan chan<- *BenchmarkResult) {
+// benchmarkRangeScan performs RANGE SCAN operation benchmark
+func (bc *BenchmarkClient) benchmarkRangeScan(wg *sync.WaitGroup, resultChan chan<- *BenchmarkResult) {
 	defer wg.Done()
 	stats := &LatencyStats{}
 	var totalOps int64
 	var errors int64
-	
-	// First, set some data for SCAN testing (before timing)
+	// First, set some data for RANGE SCAN testing (before timing)
 	value := generateValue(bc.config.ValueSize)
 	for i := 0; i < 1000; i++ {
-		key := fmt.Sprintf("%s_scan_%d", bc.config.KeyPrefix, i)
+		key := fmt.Sprintf("%s_range_scan_%d", bc.config.KeyPrefix, i)
 		if bc.config.UseGrpc && bc.grpcClient != nil {
 			_, _ = bc.grpcClient.Set(context.Background(), &pb.SetRequest{Key: key, Value: value})
 		} else {
-			reqBody := SetRequest{
-				Key:   key,
-				Value: value,
-			}
-			
-			jsonData, _ := json.Marshal(reqBody)
-			resp, err := bc.httpClient.Post(
-				fmt.Sprintf("http://%s/api/v1/set", bc.config.ServerAddr),
-				"application/json",
-				bytes.NewBuffer(jsonData),
-			)
-			if err == nil && resp.StatusCode == http.StatusOK {
+			// HTTP 预置数据也用PUT
+			jsonData, _ := json.Marshal(map[string]string{"value": value})
+			req, _ := http.NewRequest("PUT", fmt.Sprintf("http://%s/api/v1/keys/%s", bc.config.ServerAddr, key), bytes.NewBuffer(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := bc.httpClient.Do(req)
+			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				resp.Body.Close()
 			}
 		}
 	}
-	
-	// Now benchmark SCAN operations
+	// Now benchmark RANGE SCAN operations
 	startTime := time.Now()
 	for time.Since(startTime) < bc.config.Duration {
 		start := time.Now()
 		if bc.config.UseGrpc && bc.grpcClient != nil {
-			resp, err := bc.grpcClient.Scan(context.Background(), &pb.ScanRequest{Prefix: bc.config.ScanPrefix, Limit: int32(bc.config.ScanLimit)})
+			resp, err := bc.grpcClient.RangeScan(context.Background(), &pb.RangeScanRequest{Prefix: bc.config.ScanPrefix, Limit: int32(bc.config.ScanLimit)})
 			latency := time.Since(start)
 			if err != nil {
 				errors++
 				continue
 			}
-			if resp.Success {
+			if resp.Code == 0 {
 				stats.Add(latency)
 				totalOps++
 			} else {
@@ -357,7 +384,7 @@ func (bc *BenchmarkClient) benchmarkScan(wg *sync.WaitGroup, resultChan chan<- *
 			}
 		} else {
 			resp, err := bc.httpClient.Get(
-				fmt.Sprintf("http://%s/api/v1/scan?prefix=%s&limit=%d", 
+				fmt.Sprintf("http://%s/api/v1/keys?prefix=%s&limit=%d", 
 					bc.config.ServerAddr, bc.config.ScanPrefix, bc.config.ScanLimit),
 			)
 			latency := time.Since(start)
@@ -365,19 +392,21 @@ func (bc *BenchmarkClient) benchmarkScan(wg *sync.WaitGroup, resultChan chan<- *
 				errors++
 				continue
 			}
-			if resp.StatusCode != http.StatusOK {
-				errors++
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				var apiResp APIResponse
+				_ = json.NewDecoder(resp.Body).Decode(&apiResp)
 				resp.Body.Close()
+				errors++
 				continue
 			}
-			var apiResp Response
+			var apiResp APIResponse
 			if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-				errors++
 				resp.Body.Close()
+				errors++
 				continue
 			}
 			resp.Body.Close()
-			if !apiResp.Success {
+			if apiResp.Code != 0 || apiResp.SuccessCount == 0 || len(apiResp.KVs) == 0 {
 				errors++
 				continue
 			}
@@ -385,12 +414,10 @@ func (bc *BenchmarkClient) benchmarkScan(wg *sync.WaitGroup, resultChan chan<- *
 			totalOps++
 		}
 	}
-	
 	// Calculate statistics
 	min, max, avg, p50, p95, p99 := stats.Calculate()
-	
 	result := &BenchmarkResult{
-		Operation:     "SCAN",
+		Operation:     "RANGE_SCAN",
 		TotalOps:      totalOps,
 		TotalTime:     time.Since(startTime),
 		Throughput:    float64(totalOps) / time.Since(startTime).Seconds(),
@@ -403,7 +430,6 @@ func (bc *BenchmarkClient) benchmarkScan(wg *sync.WaitGroup, resultChan chan<- *
 		Errors:        errors,
 		ErrorRate:     float64(errors) / float64(totalOps+errors) * 100,
 	}
-	
 	resultChan <- result
 }
 
@@ -466,8 +492,9 @@ func main() {
 		valueSize     = flag.Int("value-size", 100, "Size of test values in bytes")
 		scanPrefix    = flag.String("scan-prefix", "bench", "Prefix for scan operations")
 		scanLimit     = flag.Int("scan-limit", 100, "Limit for scan operations")
-		operations    = flag.String("operations", "set,get,scan", "Operations to benchmark (comma-separated)")
+		operations    = flag.String("operations", "set,get,range-scan", "Operations to benchmark (comma-separated)")
 		reportInterval = flag.Duration("report-interval", 5*time.Second, "Progress report interval")
+		batchSize     = flag.Int("batch-size", 0, "Batch size for batch operations (0 = single operations)")
 	)
 	flag.Parse()
 	config := &BenchmarkConfig{
@@ -483,6 +510,11 @@ func main() {
 		ReportInterval: *reportInterval,
 	}
 	
+	// 如果没有指定gRPC地址，使用HTTP服务器地址
+	if config.UseGrpc && config.GrpcAddr == "" {
+		config.GrpcAddr = config.ServerAddr
+	}
+	
 	client := NewBenchmarkClient(config)
 	
 	fmt.Printf("=== Distributed Cache Benchmark ===\n")
@@ -493,16 +525,25 @@ func main() {
 	fmt.Printf("Operations: %s\n", *operations)
 	fmt.Printf("Scan Prefix: %s, Limit: %d\n", config.ScanPrefix, config.ScanLimit)
 	fmt.Printf("Report Interval: %v\n", config.ReportInterval)
+	if *batchSize > 0 {
+		fmt.Printf("Batch Size: %d\n", *batchSize)
+	}
+	
+	// If batch mode is enabled, run batch benchmark
+	if *batchSize > 0 {
+		runBatchBenchmark(client, *batchSize, *duration)
+		return
+	}
 	
 	// Parse operations
 	ops := make(map[string]bool)
-	for _, op := range []string{"set", "get", "scan"} {
+	for _, op := range []string{"set", "get", "range-scan"} {
 		ops[op] = false
 	}
 	
 	for _, reqOp := range strings.Split(*operations, ",") {
 		reqOp = strings.TrimSpace(reqOp)
-		if reqOp == "set" || reqOp == "get" || reqOp == "scan" {
+		if reqOp == "set" || reqOp == "get" || reqOp == "range-scan" {
 			ops[reqOp] = true
 		}
 	}
@@ -516,7 +557,7 @@ func main() {
 	if ops["get"] {
 		totalGoroutines += config.Concurrency
 	}
-	if ops["scan"] {
+	if ops["range-scan"] {
 		totalGoroutines += config.Concurrency
 	}
 	
@@ -538,10 +579,10 @@ func main() {
 		}
 	}
 	
-	if ops["scan"] {
+	if ops["range-scan"] {
 		for i := 0; i < config.Concurrency; i++ {
 			wg.Add(1)
-			go client.benchmarkScan(&wg, resultChan)
+			go client.benchmarkRangeScan(&wg, resultChan)
 		}
 	}
 	
@@ -557,4 +598,179 @@ func main() {
 	
 	// Print summary
 	printSummary(results)
+}
+
+func runBatchBenchmark(client *BenchmarkClient, batchSize int, duration time.Duration) {
+	var totalOps, totalErrors int64
+	var latencies []time.Duration
+	start := time.Now()
+	
+	fmt.Printf("Starting batch benchmark with batch size %d...\n", batchSize)
+	
+	for time.Since(start) < duration {
+		var pairs []*pb.KeyValue
+		for i := 0; i < batchSize; i++ {
+			key := fmt.Sprintf("batch-%d-%d", start.UnixNano(), i)
+			value := generateValue(client.config.ValueSize)
+			pairs = append(pairs, &pb.KeyValue{Key: key, Value: value})
+		}
+		
+		batchStart := time.Now()
+		if client.config.UseGrpc {
+			resp, err := client.grpcClient.BatchSet(context.Background(), &pb.BatchSetRequest{Pairs: pairs})
+			latency := time.Since(batchStart)
+			latencies = append(latencies, latency)
+			
+			if err != nil || resp.Code != 0 {
+				totalErrors += int64(batchSize)
+				if totalErrors <= 10 { // 只打印前10个错误
+					fmt.Printf("BatchSet error: %v\n", err)
+				}
+			} else {
+				totalOps += int64(resp.SuccessCount)
+				totalErrors += int64(resp.ErrorCount)
+			}
+		} else {
+			// Convert protobuf KeyValue to API KeyValue format
+			var apiPairs []map[string]string
+			for _, kv := range pairs {
+				apiPairs = append(apiPairs, map[string]string{
+					"key":   kv.Key,
+					"value": kv.Value,
+				})
+			}
+			req := map[string]interface{}{ "pairs": apiPairs }
+			jsonData, _ := json.Marshal(req)
+			resp, err := client.httpClient.Post(
+				fmt.Sprintf("http://%s/api/v1/keys", client.config.ServerAddr),
+				"application/json", bytes.NewBuffer(jsonData))
+			
+			latency := time.Since(batchStart)
+			latencies = append(latencies, latency)
+			
+			if err != nil || resp.StatusCode != http.StatusOK {
+				totalErrors += int64(batchSize)
+				if totalErrors <= 10 {
+					fmt.Printf("BatchSet HTTP error: %v\n", err)
+				}
+				continue
+			}
+			
+			var apiResp APIResponse
+			if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+				totalErrors += int64(batchSize)
+				if totalErrors <= 10 {
+					fmt.Printf("BatchSet HTTP response parse error: %v\n", err)
+				}
+				resp.Body.Close()
+				continue
+			}
+			resp.Body.Close()
+
+			if apiResp.Code != 0 {
+				totalErrors += int64(batchSize)
+				if totalErrors <= 10 {
+					fmt.Printf("BatchSet HTTP API error: code=%d, error=%s\n", apiResp.Code, apiResp.Error)
+				}
+			} else {
+				totalOps += int64(apiResp.SuccessCount)
+				totalErrors += int64(apiResp.ErrorCount)
+			}
+		}
+	}
+	
+	totalTime := time.Since(start)
+	throughput := float64(totalOps) / totalTime.Seconds()
+	
+	// Calculate latency statistics
+	if len(latencies) > 0 {
+		// Sort latencies for percentile calculation
+		sort.Slice(latencies, func(i, j int) bool {
+			return latencies[i] < latencies[j]
+		})
+		
+		minLatency := latencies[0]
+		maxLatency := latencies[len(latencies)-1]
+		
+		// Calculate average latency
+		var totalLatency time.Duration
+		for _, l := range latencies {
+			totalLatency += l
+		}
+		avgLatency := totalLatency / time.Duration(len(latencies))
+		
+		// Calculate percentiles
+		p50Idx := len(latencies) * 50 / 100
+		p95Idx := len(latencies) * 95 / 100
+		p99Idx := len(latencies) * 99 / 100
+		
+		p50Latency := latencies[p50Idx]
+		p95Latency := latencies[p95Idx]
+		p99Latency := latencies[p99Idx]
+		
+		errorRate := float64(totalErrors) / float64(totalOps+totalErrors) * 100
+		
+		fmt.Printf("\n=== BATCH_SET Benchmark Results ===\n")
+		fmt.Printf("Total Operations: %d\n", totalOps)
+		fmt.Printf("Total Time: %v\n", totalTime)
+		fmt.Printf("Throughput: %.2f ops/sec\n", throughput)
+		fmt.Printf("Average Latency: %v\n", avgLatency)
+		fmt.Printf("Min Latency: %v\n", minLatency)
+		fmt.Printf("Max Latency: %v\n", maxLatency)
+		fmt.Printf("P50 Latency: %v\n", p50Latency)
+		fmt.Printf("P95 Latency: %v\n", p95Latency)
+		fmt.Printf("P99 Latency: %v\n", p99Latency)
+		fmt.Printf("Errors: %d (%.2f%%)\n", totalErrors, errorRate)
+		
+		fmt.Printf("\n=== Benchmark Summary ===\n")
+		fmt.Printf("Operation    Throughput  Avg Latency  P95 Latency  P99 Latency   Error Rate\n")
+		fmt.Printf("---------    ---------- ------------ ------------ ------------   ----------\n")
+		fmt.Printf("%-10s %12.2f %12v %12v %12v %12.2f%%\n",
+			"BATCH_SET",
+			throughput,
+			avgLatency,
+			p95Latency,
+			p99Latency,
+			errorRate)
+	} else {
+		fmt.Printf("No successful operations recorded.\n")
+	}
+}
+
+func runStreamBenchmark(client *BenchmarkClient, batchSize int, duration time.Duration) {
+	var totalOps, totalErrors int64
+	start := time.Now()
+	for time.Since(start) < duration {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		stream, err := client.grpcClient.StreamSet(ctx)
+		if err != nil {
+			fmt.Printf("StreamSet error: %v\n", err)
+			cancel()
+			continue
+		}
+		for i := 0; i < batchSize; i++ {
+			key := fmt.Sprintf("stream-%d-%d", start.UnixNano(), i)
+			value := generateValue(client.config.ValueSize)
+			if err := stream.Send(&pb.SetRequest{Key: key, Value: value}); err != nil {
+				totalErrors++
+			}
+		}
+		resp, err := stream.CloseAndRecv()
+		if err != nil {
+			fmt.Printf("StreamSet close error: %v\n", err)
+			totalErrors += int64(batchSize)
+		} else {
+			totalOps += int64(resp.SuccessCount)
+			totalErrors += int64(resp.ErrorCount)
+		}
+		cancel()
+	}
+	fmt.Printf("StreamSet: TotalOps=%d, TotalErrors=%d\n", totalOps, totalErrors)
+}
+
+func runSingleBenchmark(client *BenchmarkClient, duration time.Duration) {
+	// 原有的单条set/get/scan逻辑
+	client.benchmarkSet(nil, nil)
+	client.benchmarkGet(nil, nil)
+	client.benchmarkRangeScan(nil, nil)
 } 

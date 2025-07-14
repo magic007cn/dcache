@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"dcache/internal/server"
 	"dcache/internal/config"
@@ -38,6 +42,7 @@ for data consistency across multiple nodes.`,
 	rootCmd.PersistentFlags().String("initial-advertise-peer-urls", "", "initial advertise peer urls")
 	rootCmd.PersistentFlags().String("initial-cluster", "", "initial cluster config")
 	rootCmd.PersistentFlags().String("node-id", "", "node id")
+	rootCmd.PersistentFlags().String("storage-mode", "", "storage mode (inmemory, persistent)")
 
 	// 绑定flag到viper
 	_ = viper.BindPFlag("log-level", rootCmd.PersistentFlags().Lookup("log-level"))
@@ -50,6 +55,7 @@ for data consistency across multiple nodes.`,
 	_ = viper.BindPFlag("initial-advertise-peer-urls", rootCmd.PersistentFlags().Lookup("initial-advertise-peer-urls"))
 	_ = viper.BindPFlag("initial-cluster", rootCmd.PersistentFlags().Lookup("initial-cluster"))
 	_ = viper.BindPFlag("node-id", rootCmd.PersistentFlags().Lookup("node-id"))
+	_ = viper.BindPFlag("storage-mode", rootCmd.PersistentFlags().Lookup("storage-mode"))
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -77,5 +83,41 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create server: %v", err)
 	}
 
-	return srv.Start()
+	// Create context for graceful shutdown
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		if err := srv.Start(); err != nil {
+			errChan <- err
+		}
+	}()
+
+	// Wait for either signal or server error
+	select {
+	case sig := <-sigChan:
+		logrus.Infof("Received signal %v, starting graceful shutdown...", sig)
+		
+		// Create shutdown context with timeout
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		
+		// Stop server gracefully
+		if err := srv.StopWithContext(shutdownCtx); err != nil {
+			logrus.Errorf("Error during graceful shutdown: %v", err)
+			return err
+		}
+		
+		logrus.Info("Server stopped gracefully")
+		return nil
+		
+	case err := <-errChan:
+		return fmt.Errorf("server error: %v", err)
+	}
 } 

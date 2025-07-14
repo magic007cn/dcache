@@ -19,32 +19,36 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DCache_Set_FullMethodName    = "/dcache.DCache/Set"
-	DCache_Get_FullMethodName    = "/dcache.DCache/Get"
-	DCache_Delete_FullMethodName = "/dcache.DCache/Delete"
-	DCache_Scan_FullMethodName   = "/dcache.DCache/Scan"
-	DCache_Status_FullMethodName = "/dcache.DCache/Status"
-	DCache_Health_FullMethodName = "/dcache.DCache/Health"
+	DCache_Set_FullMethodName         = "/dcache.DCache/Set"
+	DCache_Get_FullMethodName         = "/dcache.DCache/Get"
+	DCache_Delete_FullMethodName      = "/dcache.DCache/Delete"
+	DCache_RangeScan_FullMethodName   = "/dcache.DCache/RangeScan"
+	DCache_BatchSet_FullMethodName    = "/dcache.DCache/BatchSet"
+	DCache_BatchGet_FullMethodName    = "/dcache.DCache/BatchGet"
+	DCache_BatchDelete_FullMethodName = "/dcache.DCache/BatchDelete"
+	DCache_StreamSet_FullMethodName   = "/dcache.DCache/StreamSet"
+	DCache_Status_FullMethodName      = "/dcache.DCache/Status"
+	DCache_Health_FullMethodName      = "/dcache.DCache/Health"
+	DCache_Members_FullMethodName     = "/dcache.DCache/Members"
 )
 
 // DCacheClient is the client API for DCache service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// DCache service definition
+// DCache service
 type DCacheClient interface {
-	// Set a key-value pair
 	Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*SetResponse, error)
-	// Get a value by key
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
-	// Delete a key
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
-	// Scan keys with prefix
-	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
-	// Get cluster status
+	RangeScan(ctx context.Context, in *RangeScanRequest, opts ...grpc.CallOption) (*RangeScanResponse, error)
+	BatchSet(ctx context.Context, in *BatchSetRequest, opts ...grpc.CallOption) (*BatchSetResponse, error)
+	BatchGet(ctx context.Context, in *BatchGetRequest, opts ...grpc.CallOption) (*BatchGetResponse, error)
+	BatchDelete(ctx context.Context, in *BatchDeleteRequest, opts ...grpc.CallOption) (*BatchDeleteResponse, error)
+	StreamSet(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SetRequest, StreamSetResponse], error)
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
-	// Health check
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	Members(ctx context.Context, in *MembersRequest, opts ...grpc.CallOption) (*MembersResponse, error)
 }
 
 type dCacheClient struct {
@@ -85,15 +89,58 @@ func (c *dCacheClient) Delete(ctx context.Context, in *DeleteRequest, opts ...gr
 	return out, nil
 }
 
-func (c *dCacheClient) Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error) {
+func (c *dCacheClient) RangeScan(ctx context.Context, in *RangeScanRequest, opts ...grpc.CallOption) (*RangeScanResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ScanResponse)
-	err := c.cc.Invoke(ctx, DCache_Scan_FullMethodName, in, out, cOpts...)
+	out := new(RangeScanResponse)
+	err := c.cc.Invoke(ctx, DCache_RangeScan_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
+
+func (c *dCacheClient) BatchSet(ctx context.Context, in *BatchSetRequest, opts ...grpc.CallOption) (*BatchSetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchSetResponse)
+	err := c.cc.Invoke(ctx, DCache_BatchSet_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dCacheClient) BatchGet(ctx context.Context, in *BatchGetRequest, opts ...grpc.CallOption) (*BatchGetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchGetResponse)
+	err := c.cc.Invoke(ctx, DCache_BatchGet_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dCacheClient) BatchDelete(ctx context.Context, in *BatchDeleteRequest, opts ...grpc.CallOption) (*BatchDeleteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchDeleteResponse)
+	err := c.cc.Invoke(ctx, DCache_BatchDelete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dCacheClient) StreamSet(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SetRequest, StreamSetResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &DCache_ServiceDesc.Streams[0], DCache_StreamSet_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SetRequest, StreamSetResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type DCache_StreamSetClient = grpc.ClientStreamingClient[SetRequest, StreamSetResponse]
 
 func (c *dCacheClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -115,24 +162,33 @@ func (c *dCacheClient) Health(ctx context.Context, in *HealthRequest, opts ...gr
 	return out, nil
 }
 
+func (c *dCacheClient) Members(ctx context.Context, in *MembersRequest, opts ...grpc.CallOption) (*MembersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembersResponse)
+	err := c.cc.Invoke(ctx, DCache_Members_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DCacheServer is the server API for DCache service.
 // All implementations must embed UnimplementedDCacheServer
 // for forward compatibility.
 //
-// DCache service definition
+// DCache service
 type DCacheServer interface {
-	// Set a key-value pair
 	Set(context.Context, *SetRequest) (*SetResponse, error)
-	// Get a value by key
 	Get(context.Context, *GetRequest) (*GetResponse, error)
-	// Delete a key
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
-	// Scan keys with prefix
-	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
-	// Get cluster status
+	RangeScan(context.Context, *RangeScanRequest) (*RangeScanResponse, error)
+	BatchSet(context.Context, *BatchSetRequest) (*BatchSetResponse, error)
+	BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error)
+	BatchDelete(context.Context, *BatchDeleteRequest) (*BatchDeleteResponse, error)
+	StreamSet(grpc.ClientStreamingServer[SetRequest, StreamSetResponse]) error
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
-	// Health check
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	Members(context.Context, *MembersRequest) (*MembersResponse, error)
 	mustEmbedUnimplementedDCacheServer()
 }
 
@@ -152,14 +208,29 @@ func (UnimplementedDCacheServer) Get(context.Context, *GetRequest) (*GetResponse
 func (UnimplementedDCacheServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
 }
-func (UnimplementedDCacheServer) Scan(context.Context, *ScanRequest) (*ScanResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Scan not implemented")
+func (UnimplementedDCacheServer) RangeScan(context.Context, *RangeScanRequest) (*RangeScanResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RangeScan not implemented")
+}
+func (UnimplementedDCacheServer) BatchSet(context.Context, *BatchSetRequest) (*BatchSetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BatchSet not implemented")
+}
+func (UnimplementedDCacheServer) BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BatchGet not implemented")
+}
+func (UnimplementedDCacheServer) BatchDelete(context.Context, *BatchDeleteRequest) (*BatchDeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BatchDelete not implemented")
+}
+func (UnimplementedDCacheServer) StreamSet(grpc.ClientStreamingServer[SetRequest, StreamSetResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method StreamSet not implemented")
 }
 func (UnimplementedDCacheServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Status not implemented")
 }
 func (UnimplementedDCacheServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
+}
+func (UnimplementedDCacheServer) Members(context.Context, *MembersRequest) (*MembersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Members not implemented")
 }
 func (UnimplementedDCacheServer) mustEmbedUnimplementedDCacheServer() {}
 func (UnimplementedDCacheServer) testEmbeddedByValue()                {}
@@ -236,23 +307,84 @@ func _DCache_Delete_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DCache_Scan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ScanRequest)
+func _DCache_RangeScan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RangeScanRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(DCacheServer).Scan(ctx, in)
+		return srv.(DCacheServer).RangeScan(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: DCache_Scan_FullMethodName,
+		FullMethod: DCache_RangeScan_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DCacheServer).Scan(ctx, req.(*ScanRequest))
+		return srv.(DCacheServer).RangeScan(ctx, req.(*RangeScanRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _DCache_BatchSet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchSetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DCacheServer).BatchSet(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DCache_BatchSet_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DCacheServer).BatchSet(ctx, req.(*BatchSetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DCache_BatchGet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchGetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DCacheServer).BatchGet(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DCache_BatchGet_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DCacheServer).BatchGet(ctx, req.(*BatchGetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DCache_BatchDelete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchDeleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DCacheServer).BatchDelete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DCache_BatchDelete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DCacheServer).BatchDelete(ctx, req.(*BatchDeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DCache_StreamSet_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(DCacheServer).StreamSet(&grpc.GenericServerStream[SetRequest, StreamSetResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type DCache_StreamSetServer = grpc.ClientStreamingServer[SetRequest, StreamSetResponse]
 
 func _DCache_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StatusRequest)
@@ -290,6 +422,24 @@ func _DCache_Health_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DCache_Members_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MembersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DCacheServer).Members(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DCache_Members_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DCacheServer).Members(ctx, req.(*MembersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DCache_ServiceDesc is the grpc.ServiceDesc for DCache service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -310,8 +460,20 @@ var DCache_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DCache_Delete_Handler,
 		},
 		{
-			MethodName: "Scan",
-			Handler:    _DCache_Scan_Handler,
+			MethodName: "RangeScan",
+			Handler:    _DCache_RangeScan_Handler,
+		},
+		{
+			MethodName: "BatchSet",
+			Handler:    _DCache_BatchSet_Handler,
+		},
+		{
+			MethodName: "BatchGet",
+			Handler:    _DCache_BatchGet_Handler,
+		},
+		{
+			MethodName: "BatchDelete",
+			Handler:    _DCache_BatchDelete_Handler,
 		},
 		{
 			MethodName: "Status",
@@ -321,7 +483,17 @@ var DCache_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Health",
 			Handler:    _DCache_Health_Handler,
 		},
+		{
+			MethodName: "Members",
+			Handler:    _DCache_Members_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamSet",
+			Handler:       _DCache_StreamSet_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "proto/dcache.proto",
 }

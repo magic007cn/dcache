@@ -21,6 +21,9 @@ initial-advertise-peer-urls: "tcp://127.0.0.1:9093"
 # Format: "node1=http://127.0.0.1:9093,node2=http://127.0.0.1:8082,node3=http://127.0.0.1:8083"
 initial-cluster: "node1=tcp://127.0.0.1:9091,node2=tcp://127.0.0.1:9092,node3=tcp://127.0.0.1:9093"
 
+# Storage mode
+storage-mode: "inmemory"
+
 # Log level
 log-level: "warn"
 raft-log-level: "warn" 

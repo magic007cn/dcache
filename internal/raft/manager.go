@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"net"
 	"net/http"
@@ -29,7 +31,7 @@ type Manager struct {
 // NewManager creates a new Raft manager
 func NewManager(cfg *config.Config, log *logrus.Logger) (*Manager, error) {
 	// Create storage
-	store, err := storage.NewBadgerStore(cfg.DataDir, log)
+	store, err := storage.NewBadgerStore(cfg.DataDir, cfg.StorageMode, log)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %v", err)
 	}
@@ -50,8 +52,8 @@ func NewManager(cfg *config.Config, log *logrus.Logger) (*Manager, error) {
 	raftConfig.LocalID = raft.ServerID(cfg.GetNodeID())
 	raftConfig.SnapshotInterval = 20 * time.Second
 	raftConfig.SnapshotThreshold = 1000
-	raftConfig.HeartbeatTimeout = 1000 * time.Millisecond
-	raftConfig.ElectionTimeout = 1000 * time.Millisecond
+	raftConfig.HeartbeatTimeout = 2000 * time.Millisecond
+	raftConfig.ElectionTimeout = 5000 * time.Millisecond
 	raftConfig.CommitTimeout = 5000 * time.Millisecond
 	raftConfig.MaxAppendEntries = 64
 	raftConfig.ShutdownOnRemove = false
@@ -110,9 +112,22 @@ func (m *Manager) Start() error {
 	} else if m.config.InitialCluster != "" {
 		// 只有在没有现有配置且有初始集群配置时才bootstrap
 		m.log.Info("No existing cluster found, bootstrapping new cluster")
-		if err := m.bootstrapCluster(); err != nil {
+		bootstrapErr := m.bootstrapCluster()
+		if bootstrapErr != nil {
 			// 如果bootstrap失败，可能是因为集群已经存在，记录警告但继续
-			m.log.Warnf("Bootstrap failed (this is normal if cluster already exists): %v", err)
+			m.log.Warnf("Bootstrap failed (this is normal if cluster already exists): %v", bootstrapErr)
+		}
+		
+		// 对于单节点模式，如果bootstrap失败，尝试强制重新bootstrap
+		if bootstrapErr != nil && len(m.config.GetInitialClusterMap()) == 1 {
+			m.log.Info("Single node mode detected, attempting to force bootstrap")
+			// 等待一段时间让raft稳定
+			time.Sleep(500 * time.Millisecond)
+			if err := m.bootstrapCluster(); err != nil {
+				m.log.Errorf("Force bootstrap failed: %v", err)
+			} else {
+				m.log.Info("Force bootstrap successful")
+			}
 		}
 	} else {
 		m.log.Info("No initial cluster configuration, waiting to join existing cluster")
@@ -285,6 +300,29 @@ func (m *Manager) ApplyCommand(cmd *storage.Command) (interface{}, error) {
 	return future.Response(), nil
 }
 
+// BatchSet applies a batch set command to the Raft cluster (strong consistency)
+func (m *Manager) BatchSet(pairs []storage.KeyValue) error {
+	if !m.IsLeader() {
+		return fmt.Errorf("not leader")
+	}
+	// gob 编码 pairs
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(pairs); err != nil {
+		return fmt.Errorf("failed to encode batch: %v", err)
+	}
+	cmd := &storage.Command{
+		Op:   "BATCH_SET",
+		Data: buf.Bytes(),
+	}
+	// gob 编码 Command
+	var cmdBuf bytes.Buffer
+	if err := gob.NewEncoder(&cmdBuf).Encode(cmd); err != nil {
+		return fmt.Errorf("failed to encode command: %v", err)
+	}
+	future := m.raft.Apply(cmdBuf.Bytes(), 5*time.Second)
+	return future.Error()
+}
+
 // Get retrieves a value from the store
 func (m *Manager) Get(key string) (string, error) {
 	data, err := m.store.Get(key)
@@ -311,18 +349,13 @@ func (m *Manager) Set(key string, value []byte) error {
 }
 
 // Delete deletes a key from the store (only on leader)
-func (m *Manager) Delete(key string) error {
+func (m *Manager) Delete(key string, errorOnNotExists bool) error {
 	if !m.IsLeader() {
 		return fmt.Errorf("not leader")
 	}
 
-	cmd := &storage.Command{
-		Op:  "DEL",
-		Key: key,
-	}
-
-	_, err := m.ApplyCommand(cmd)
-	return err
+	// 直接调用存储层，避免通过 Raft 共识（因为 errorOnNotExists 是本地参数）
+	return m.store.Delete(key, errorOnNotExists)
 }
 
 // Scan performs a range scan
@@ -371,6 +404,13 @@ func (m *Manager) GetNodes() []string {
 func (m *Manager) IsHealthy() bool {
 	return m.raft.State() != raft.Shutdown
 }
+
+// GetConfig returns the configuration
+func (m *Manager) GetConfig() interface{} {
+	return m.config
+}
+
+
 
 // stableStoreWrapper wraps BadgerStore to implement raft.StableStore
 type stableStoreWrapper struct {

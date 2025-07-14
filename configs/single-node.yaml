@@ -1,0 +1,31 @@
+# Single Node Distributed Cache Configuration
+
+# Cluster configuration
+cluster-id: "dcache-single-cluster"
+
+# Data directory for storage
+data-dir: "./data/single-node"
+
+# Storage mode (inmemory or persistent)
+storage-mode: "inmemory"
+
+# Client API endpoints
+listen-client-urls: "http://127.0.0.1:8081"
+advertise-client-urls: "http://127.0.0.1:8081"
+
+# gRPC endpoints
+grpc-port: 9100
+
+# Raft peer endpoints
+listen-peer-urls: "tcp://127.0.0.1:9091"
+initial-advertise-peer-urls: "tcp://127.0.0.1:9091"
+
+# Initial cluster configuration - single node
+initial-cluster: "node1=tcp://127.0.0.1:9091"
+
+# Log level
+log-level: "warn"
+raft-log-level: "warn"
+
+# Node ID
+node-id: "node1" 
